@@ -23,6 +23,7 @@
 //! [arXiv:2606.09050]: https://arxiv.org/abs/2606.09050
 
 pub mod audio;
+pub mod backends;
 pub mod config;
 pub mod encoders;
 pub mod frc;
