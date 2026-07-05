@@ -21,10 +21,11 @@ mod mrte;
 
 pub use card::card_mask;
 pub use dit::{ChunkDiTBlock, RotaryEmbedding, TimestepEmbedding};
+use dit::NonAffineLayerNorm;
 pub use mrte::Mrte;
 
 use candle_core::{DType, Device, Tensor};
-use candle_nn::{layer_norm, linear, LayerNorm, LayerNormConfig, Linear, Module, VarBuilder};
+use candle_nn::{linear, Linear, Module, VarBuilder};
 
 use crate::{Error, Result};
 
@@ -87,19 +88,14 @@ impl Default for MeanVc1Config {
 #[derive(Debug)]
 struct AdaLayerNormFinal {
     linear: Linear,
-    norm: LayerNorm,
+    norm: NonAffineLayerNorm,
 }
 
 impl AdaLayerNormFinal {
     fn new(dim: usize, vb: VarBuilder) -> candle_core::Result<Self> {
-        let ln = LayerNormConfig {
-            affine: false,
-            eps: 1e-6,
-            ..Default::default()
-        };
         Ok(Self {
             linear: linear(dim, dim * 2, vb.pp("linear"))?,
-            norm: layer_norm(dim, ln, vb.pp("norm"))?,
+            norm: NonAffineLayerNorm::new(1e-6),
         })
     }
 

@@ -4,3 +4,6 @@ Cargo.lock
 *.wav
 # committed golden fixtures (small, deterministic)
 !tools/fixtures/*.safetensors
+
+# local checkpoints for the v1 demo
+/ckpt/

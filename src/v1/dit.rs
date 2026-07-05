@@ -2,10 +2,30 @@
 //! rms-qk-norm attention, and the adaLN-Zero chunk block — matching the
 //! official `modules.py` parameter tree.
 
-use candle_core::{DType, Device, Tensor};
-use candle_nn::{layer_norm, linear, LayerNorm, LayerNormConfig, Linear, Module, VarBuilder};
+use candle_core::{DType, Device, Tensor, D};
+use candle_nn::{linear, Linear, Module, VarBuilder};
 
 use super::MeanVc1Config;
+
+/// LayerNorm without learnable parameters
+/// (`nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NonAffineLayerNorm {
+    eps: f64,
+}
+
+impl NonAffineLayerNorm {
+    pub(crate) fn new(eps: f64) -> Self {
+        Self { eps }
+    }
+
+    pub(crate) fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        let mean = x.mean_keepdim(D::Minus1)?;
+        let x = x.broadcast_sub(&mean)?;
+        let var = x.sqr()?.mean_keepdim(D::Minus1)?;
+        x.broadcast_div(&(var + self.eps)?.sqrt()?)
+    }
+}
 
 /// Sinusoidal timestep embedding + 2-layer MLP (`time_mlp.{0,2}`).
 ///
@@ -182,25 +202,20 @@ impl ChunkAttention {
 #[derive(Debug)]
 pub struct ChunkDiTBlock {
     ada_ln: Linear,
-    attn_norm: LayerNorm,
+    attn_norm: NonAffineLayerNorm,
     attn: ChunkAttention,
-    ff_norm: LayerNorm,
+    ff_norm: NonAffineLayerNorm,
     ff_in: Linear,
     ff_out: Linear,
 }
 
 impl ChunkDiTBlock {
     pub fn new(cfg: &MeanVc1Config, vb: VarBuilder) -> candle_core::Result<Self> {
-        let ln = LayerNormConfig {
-            affine: false,
-            eps: 1e-6,
-            ..Default::default()
-        };
         Ok(Self {
             ada_ln: linear(cfg.dim, cfg.dim * 6, vb.pp("attn_norm.linear"))?,
-            attn_norm: layer_norm(cfg.dim, ln, vb.pp("attn_norm.norm"))?,
+            attn_norm: NonAffineLayerNorm::new(1e-6),
             attn: ChunkAttention::new(cfg, vb.pp("attn"))?,
-            ff_norm: layer_norm(cfg.dim, ln, vb.pp("ff_norm"))?,
+            ff_norm: NonAffineLayerNorm::new(1e-6),
             ff_in: linear(cfg.dim, cfg.dim * cfg.ff_mult, vb.pp("ff.ff.0.0"))?,
             ff_out: linear(cfg.dim * cfg.ff_mult, cfg.dim, vb.pp("ff.ff.2"))?,
         })
