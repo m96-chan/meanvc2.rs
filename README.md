@@ -119,6 +119,17 @@ out.loss.backward()?;
 
 The JVP inside the mean-flows target is computed **exactly** with forward-mode AD (`candle_core::forward_ad::jvp`, added on the candle fork's `feat/forward-ad-jvp` branch). `JvpMode::FiniteDifference(delta)` is kept for cross-checking.
 
+## Real-time TUI demo with a virtual microphone (Linux)
+
+`meanvc-demo` converts your microphone in real time and exposes the result as a **virtual microphone** (`MeanVC-Virtual-Mic`, via a PipeWire/PulseAudio null sink) selectable from any app:
+
+```sh
+cargo run --release --features demo --bin meanvc-demo -- \
+    --reference target_voice.wav --voice-print voice_print.safetensors
+```
+
+TUI shows level meters, per-stage RTF, and supports `p` (passthrough A/B) / `q` (quit; removes the virtual device). `--wav file.wav` streams a file instead of the mic, `--headless` / `--out out.wav` / `--duration N` support scripted runs. Requires the checkpoints under `ckpt/` (see `examples/convert_v1.rs`) and `pactl`. Measured on a single CPU: VC stage RTF ≈ 0.57 and vocoder RTF ≈ 0.57 running pipelined — sustained real time with ~0.6 s latency.
+
 ## External components
 
 MeanVC 2 trains only the UTTE and the DiT decoder. The three frozen components are pretrained external models, abstracted as traits in [`src/encoders.rs`](src/encoders.rs) with pure-candle backends in [`src/backends/`](src/backends/):
