@@ -199,6 +199,13 @@ fn pulse_spec() -> Spec {
 }
 
 fn main() -> anyhow::Result<()> {
+    // candle's CPU gemm uses a rayon pool that defaults to all logical
+    // cores; on SMT machines the contention roughly triples small-chunk
+    // latency (measured: vocoder chunk RTF 0.57 -> 0.06 with the pool
+    // pinned to physical cores). Must run before the first tensor op.
+    if std::env::var_os("RAYON_NUM_THREADS").is_none() {
+        std::env::set_var("RAYON_NUM_THREADS", num_cpus::get_physical().to_string());
+    }
     let args = parse_args();
     let device = Device::Cpu;
 

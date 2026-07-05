@@ -17,6 +17,7 @@ rustfft = "6"
 thiserror = "2"
 # TUI demo (feature "demo")
 anyhow = { version = "1", optional = true }
+num_cpus = { version = "1", optional = true }
 ratatui = { version = "0.29", optional = true }
 crossterm = { version = "0.28", optional = true }
 libpulse-binding = { version = "2", optional = true }
@@ -29,7 +30,7 @@ hound = "3"
 
 [features]
 default = []
-demo = ["dep:anyhow", "dep:ratatui", "dep:crossterm", "dep:libpulse-binding", "dep:libpulse-simple-binding", "dep:hound"]
+demo = ["dep:anyhow", "dep:num_cpus", "dep:ratatui", "dep:crossterm", "dep:libpulse-binding", "dep:libpulse-simple-binding", "dep:hound"]
 cuda = ["candle-core/cuda", "candle-nn/cuda"]
 metal = ["candle-core/metal", "candle-nn/metal"]
 
