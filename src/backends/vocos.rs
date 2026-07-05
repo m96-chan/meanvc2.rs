@@ -56,6 +56,21 @@ impl Default for VocosConfig {
 }
 
 impl VocosConfig {
+    /// The official MeanVC v1 vocoder (`vocos.pt` on ASLP-lab/MeanVC):
+    /// 16 kHz, dim 320, n_fft 640, hop 160, mel input in the
+    /// [`crate::v1::MelV1`] domain.
+    pub fn official_meanvc1() -> Self {
+        Self {
+            input_channels: 80,
+            dim: 320,
+            intermediate_dim: 1536,
+            num_layers: 8,
+            n_fft: 640,
+            hop_length: 160,
+            sample_rate: 16_000,
+        }
+    }
+
     /// A config whose ISTFT head matches the given mel analysis settings.
     pub fn for_mel(mel: &crate::config::MelConfig) -> Self {
         Self {

@@ -17,9 +17,11 @@
 
 mod card;
 mod dit;
+mod mel;
 mod mrte;
 
 pub use card::card_mask;
+pub use mel::MelV1;
 pub use dit::{ChunkDiTBlock, RotaryEmbedding, TimestepEmbedding};
 use dit::NonAffineLayerNorm;
 pub use mrte::Mrte;

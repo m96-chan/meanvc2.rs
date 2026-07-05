@@ -51,6 +51,9 @@ pub struct FastU2ppConfig {
     pub num_layers: usize,
     /// Depthwise convolution kernel size.
     pub cnn_kernel: usize,
+    /// Whether the conv modules have dual streaming/non-streaming paths
+    /// (Fast-U2++) and which one to run. `None` = single-path (plain U2++).
+    pub dual_conv_streaming: Option<bool>,
     /// Attention chunk size in subsampled (40 ms) frames; 2 = 80 ms.
     pub chunk_frames: usize,
     /// Number of past chunks each chunk attends to (`usize::MAX` = all).
@@ -68,8 +71,9 @@ impl Default for FastU2ppConfig {
             d_model: 256,
             num_heads: 4,
             ff_dim: 2048,
-            num_layers: 12,
-            cnn_kernel: 15,
+            num_layers: 7,
+            cnn_kernel: 9,
+            dual_conv_streaming: Some(true),
             chunk_frames: 2,
             left_chunks: usize::MAX,
             cmvn: false,
@@ -240,6 +244,7 @@ struct ConvolutionModule {
     pointwise_conv2: Conv1d,
     norm: ConvNorm,
     kernel: usize,
+    causal: bool,
 }
 
 impl ConvolutionModule {
@@ -247,6 +252,7 @@ impl ConvolutionModule {
         d_model: usize,
         kernel: usize,
         use_layer_norm: bool,
+        causal: bool,
         vb: VarBuilder,
     ) -> candle_core::Result<Self> {
         let dw_cfg = Conv1dConfig {
@@ -280,6 +286,7 @@ impl ConvolutionModule {
             )?,
             norm,
             kernel,
+            causal,
         })
     }
 
@@ -290,10 +297,15 @@ impl ConvolutionModule {
         // GLU over the channel dim.
         let halves = x.chunk(2, 1)?;
         let x = halves[0].mul(&candle_nn::ops::sigmoid(&halves[1])?)?;
-        // Causal left padding keeps the module streamable.
         let (b, d, _) = x.dims3()?;
-        let pad = Tensor::zeros((b, d, self.kernel - 1), x.dtype(), x.device())?;
-        let x = Tensor::cat(&[pad, x], 2)?;
+        let x = if self.causal {
+            // Causal left padding keeps the module streamable.
+            let pad = Tensor::zeros((b, d, self.kernel - 1), x.dtype(), x.device())?;
+            Tensor::cat(&[pad, x], 2)?
+        } else {
+            let pad = Tensor::zeros((b, d, (self.kernel - 1) / 2), x.dtype(), x.device())?;
+            Tensor::cat(&[pad.clone(), x, pad], 2)?
+        };
         let x = self.depthwise_conv.forward(&x)?;
         let x = match &self.norm {
             ConvNorm::Layer(ln) => ln.forward(&x.transpose(1, 2)?)?.transpose(1, 2)?,
@@ -310,6 +322,9 @@ struct ConformerBlock {
     feed_forward_macaron: FeedForward,
     self_attn: RelPositionAttention,
     conv_module: ConvolutionModule,
+    /// Fast-U2++ dual-mode convolution: the alternate (non-streaming) path.
+    conv_module_alt: Option<ConvolutionModule>,
+    use_alt_conv: bool,
     feed_forward: FeedForward,
     norm_ff_macaron: LayerNorm,
     norm_mha: LayerNorm,
@@ -328,12 +343,33 @@ impl ConformerBlock {
                 vb.pp("feed_forward_macaron"),
             )?,
             self_attn: RelPositionAttention::new(cfg.d_model, cfg.num_heads, vb.pp("self_attn"))?,
-            conv_module: ConvolutionModule::new(
-                cfg.d_model,
-                cfg.cnn_kernel,
-                true,
-                vb.pp("conv_module"),
-            )?,
+            conv_module: match cfg.dual_conv_streaming {
+                None => ConvolutionModule::new(
+                    cfg.d_model,
+                    cfg.cnn_kernel,
+                    true,
+                    true,
+                    vb.pp("conv_module"),
+                )?,
+                Some(_) => ConvolutionModule::new(
+                    cfg.d_model,
+                    cfg.cnn_kernel,
+                    true,
+                    true,
+                    vb.pp("conv_module.streaming_conv"),
+                )?,
+            },
+            conv_module_alt: match cfg.dual_conv_streaming {
+                None => None,
+                Some(_) => Some(ConvolutionModule::new(
+                    cfg.d_model,
+                    cfg.cnn_kernel,
+                    true,
+                    false,
+                    vb.pp("conv_module.non_streaming_conv"),
+                )?),
+            },
+            use_alt_conv: cfg.dual_conv_streaming == Some(false),
             feed_forward: FeedForward::new(cfg.d_model, cfg.ff_dim, vb.pp("feed_forward"))?,
             norm_ff_macaron: layer_norm(cfg.d_model, ln, vb.pp("norm_ff_macaron"))?,
             norm_mha: layer_norm(cfg.d_model, ln, vb.pp("norm_mha"))?,
@@ -352,7 +388,11 @@ impl ConformerBlock {
             + self
                 .self_attn
                 .forward(&self.norm_mha.forward(&x)?, pos_emb, mask)?)?;
-        let x = (&x + self.conv_module.forward(&self.norm_conv.forward(&x)?)?)?;
+        let conv = match (&self.conv_module_alt, self.use_alt_conv) {
+            (Some(alt), true) => alt,
+            _ => &self.conv_module,
+        };
+        let x = (&x + conv.forward(&self.norm_conv.forward(&x)?)?)?;
         let x = (&x
             + self
                 .feed_forward
@@ -475,6 +515,7 @@ mod tests {
             cnn_kernel: 7,
             chunk_frames: 2,
             left_chunks: usize::MAX,
+            dual_conv_streaming: None,
             cmvn: false,
             sample_rate: 16_000,
         };
