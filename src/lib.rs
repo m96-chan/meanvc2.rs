@@ -30,6 +30,7 @@ pub mod frc;
 pub mod meanflow;
 pub mod model;
 pub mod streaming;
+pub mod v1;
 
 pub use config::{DecoderConfig, MeanVc2Config, MelConfig, UtteConfig};
 pub use model::MeanVc2;

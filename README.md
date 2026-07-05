@@ -17,7 +17,7 @@ This crate implements the trainable core of MeanVC 2 — UTTE, the FRC-scheduled
 
 ## MeanVC (v1) support
 
-The original **MeanVC** (Ma et al., 2025) shares the recognition–synthesis skeleton and the mean-flows decoder, but uses **chunk-wise autoregressive denoising (CARD)** instead of FRC and a reference-mel **MRTE timbre encoder** instead of UTTE. Unlike MeanVC 2, its [official implementation and pretrained checkpoints are public](https://github.com/ASLP-lab/MeanVC) (VC model, Fast-U2++, and a 16 kHz Vocos on [Hugging Face](https://huggingface.co/ASLP-lab/MeanVC)) — so this repo targets a **weight-compatible v1 port** as the fastest path to real conversion, while the v2 implementation stands ready for the official v2 release. Progress is tracked in the v1 port issue.
+The original **MeanVC** (Ma et al., 2025) shares the recognition–synthesis skeleton and the mean-flows decoder, but uses **chunk-wise autoregressive denoising (CARD)** instead of FRC and a reference-mel **MRTE timbre encoder** instead of UTTE. Unlike MeanVC 2, its [official implementation and pretrained checkpoints are public](https://github.com/ASLP-lab/MeanVC) (VC model, Fast-U2++, and a 16 kHz Vocos on [Hugging Face](https://huggingface.co/ASLP-lab/MeanVC)) — so this repo targets a **weight-compatible v1 port** as the fastest path to real conversion, while the v2 implementation stands ready for the official v2 release. Progress is tracked in [#12](https://github.com/m96-chan/meanvc2.rs/issues/12); the model lives in the `v1` module (`cargo run --release --example v1_demo`).
 
 ## Architecture
 
@@ -146,7 +146,8 @@ This is an **unofficial, experimental** implementation written from the paper �
 - [x] Streaming converter with bounded look-ahead and cached per-chunk noise
 - [x] Log-mel front-end
 - [x] Vocos / Fast-U2++ / ECAPA-TDNN inference backends (candle ports; checkpoint conversion + golden tests in [#8](https://github.com/m96-chan/meanvc2.rs/issues/8))
-- [ ] MeanVC v1 port, weight-compatible with the [official checkpoints](https://huggingface.co/ASLP-lab/MeanVC) (CARD, MRTE, RoPE DiT)
+- [x] MeanVC v1 model (`meanvc2::v1`): MRTE, CARD, RoPE + rms-qk-norm ChunkDiT — official parameter tree, 14.1M params vs the paper's 14M ([#12](https://github.com/m96-chan/meanvc2.rs/issues/12))
+- [ ] MeanVC v1 official-weight conversion + golden parity, wav-to-wav example ([#12](https://github.com/m96-chan/meanvc2.rs/issues/12))
 - [ ] MeanVC 2 pretrained weights (official release pending; training loop [#3](https://github.com/m96-chan/meanvc2.rs/issues/3) as fallback)
 
 Known deviations from the paper (details in the module docs):
