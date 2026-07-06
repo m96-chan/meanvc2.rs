@@ -1083,7 +1083,22 @@ fn main() -> anyhow::Result<()> {
                     "converted",
                     &pulse_spec_out(),
                     None,
-                    None,
+                    // Jitter reserve: hold 300 ms queued before the sink
+                    // starts draining (and re-buffer the same amount after
+                    // an underrun). Without it the sink runs dry on any
+                    // transient stall shorter than the 240 ms `late`
+                    // threshold, and the server splices silence into the
+                    // monitor/virtual-mic — audible as ticks that are NOT
+                    // present in the samples we wrote (issue #42, fourth
+                    // field recording: discontinuities at quiet passages
+                    // that no in-process stage can produce).
+                    Some(&libpulse_binding::def::BufferAttr {
+                        maxlength: u32::MAX,
+                        tlength: OUT_SR as u32 * 4, // 1 s ceiling
+                        prebuf: OUT_SR as u32 * 4 * 3 / 10,
+                        minreq: u32::MAX,
+                        fragsize: u32::MAX,
+                    }),
                 )
                 .map_err(|e| anyhow::anyhow!("pulse playback: {e}"))?,
             )
