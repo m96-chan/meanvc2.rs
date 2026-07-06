@@ -130,7 +130,15 @@ cargo run --release --features demo,wavlm --bin meanvc-demo -- \
 
 With the `wavlm` feature the 256-dim voice print is computed natively from the reference audio (export the ONNX model once with `tools/export_wavlm_onnx.py`); without it, pass a precomputed `--voice-print file.safetensors`.
 
-TUI shows level meters, per-stage RTF, and supports `p` (passthrough A/B), `l` (loopback monitor — hear the converted voice on your speakers), `q` (quit; removes the virtual device). `--monitor` starts with the loopback on. `--wav file.wav` streams a file instead of the mic, `--headless` / `--out out.wav` / `--duration N` support scripted runs. Requires the checkpoints under `ckpt/` (see `examples/convert_v1.rs`) and `pactl`. Measured on a single CPU: VC stage RTF ≈ 0.57 and vocoder RTF ≈ 0.57 running pipelined — sustained real time with ~0.6 s latency.
+TUI shows level meters, per-stage RTF, and supports `p` (passthrough A/B), `l` (loopback monitor — hear the converted voice on your speakers), `q` (quit; removes the virtual device). `--monitor` starts with the loopback on. `--wav file.wav` streams a file instead of the mic, `--headless` / `--out out.wav` / `--duration N` support scripted runs. Requires the checkpoints under `ckpt/` (see `examples/convert_v1.rs`) and `pactl`. The ASR stage streams incrementally with `FastU2pp::forward_chunk` (per-layer attention K/V + conv caches, exact WeNet `forward_chunk` parity — issue #9). Measured with `RAYON_NUM_THREADS=8`: per-stage RTF ≈ 0.06 (ASR) / 0.04 (VC) / 0.06 (vocoder), late = 0 sustained.
+
+## Performance notes
+
+candle's CPU matmuls run on a rayon pool that defaults to **all logical cores**; on SMT (hyper-threaded) machines the resulting contention makes the small per-chunk workloads ~3–10× slower. Set `RAYON_NUM_THREADS` to the number of **physical** cores for the best CPU latency — measured on an 8c/16t machine ([#19](https://github.com/m96-chan/meanvc2.rs/issues/19)): demo vocoder chunk RTF 0.57 → 0.06, offline `convert_v1` end-to-end 456 ms → 226 ms.
+
+- `meanvc-demo` and the `convert_v1` example pin the pool to physical cores automatically when `RAYON_NUM_THREADS` is unset.
+- The other offline examples, and the library itself, use candle's default; set the variable yourself, e.g. `RAYON_NUM_THREADS=8 cargo run --release --example streaming_demo`.
+- When embedding the crate, set `RAYON_NUM_THREADS` (or configure the global rayon pool) before the first tensor op — the pool size is fixed at first use.
 
 ## External components
 
@@ -161,7 +169,8 @@ This is an **unofficial, experimental** implementation written from the paper �
 - [x] Log-mel front-end
 - [x] Vocos / Fast-U2++ / ECAPA-TDNN inference backends (candle ports; checkpoint conversion + golden tests in [#8](https://github.com/m96-chan/meanvc2.rs/issues/8))
 - [x] MeanVC v1 model (`meanvc2::v1`): MRTE, CARD, RoPE + rms-qk-norm ChunkDiT — official parameter tree, 14.1M params vs the paper's 14M ([#12](https://github.com/m96-chan/meanvc2.rs/issues/12))
-- [x] MeanVC v1 official weights load + real wav-to-wav example (`cargo run --release --example convert_v1`; perceptual quality pending the Python A/B check in [#14](https://github.com/m96-chan/meanvc2.rs/issues/14))
+- [x] MeanVC v1 official weights load + real wav-to-wav example (`cargo run --release --example convert_v1`), with stage-by-stage PyTorch parity locked in by golden tests against the official implementation — DiT forward, KV-cache streaming, mel, Vocos, kaldi fbank, and the BNF pipeline ([#14](https://github.com/m96-chan/meanvc2.rs/issues/14); fixtures via `tools/gen_v1_fixtures.py`, see [`tools/README.md`](tools/README.md))
+- [x] Incremental Fast-U2++ streaming: `FastU2pp::forward_chunk` with per-layer attention-K/V and depthwise-conv caches, matching the official TorchScript chunked decode to 3e-6 (`tests/asr_streaming.rs`; chunk-cached Vocos still open in [#9](https://github.com/m96-chan/meanvc2.rs/issues/9))
 - [ ] MeanVC 2 pretrained weights (official release pending; training loop [#3](https://github.com/m96-chan/meanvc2.rs/issues/3) as fallback)
 
 Known deviations from the paper (details in the module docs):

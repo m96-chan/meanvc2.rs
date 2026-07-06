@@ -14,9 +14,11 @@
 //! `after_norm` / `global_cmvn`, so converted checkpoints map 1:1.
 //! Following WeNet, the relative-position attention omits `rel_shift`.
 //!
-//! Chunked processing is implemented with attention masks over the full
-//! utterance (identical outputs to step-by-step streaming); an incremental
-//! per-chunk cache for true streaming inference is a follow-up in issue #4.
+//! Two chunked-decoding paths produce identical outputs: [`FastU2pp::forward`]
+//! runs attention masks over the full utterance, while
+//! [`FastU2pp::forward_chunk`] streams incrementally with per-layer
+//! attention-K/V and depthwise-conv caches (WeNet's `forward_chunk`
+//! equivalent, issue #9) at O(chunk) cost per call.
 
 use candle_core::{DType, Device, Tensor, D};
 use candle_nn::{
@@ -109,13 +111,29 @@ impl FastU2ppConfig {
 }
 
 /// Sinusoidal positional encoding table `[1, len, d_model]`.
-pub(crate) fn sinusoidal_pe(len: usize, d_model: usize, device: &Device) -> candle_core::Result<Tensor> {
+pub(crate) fn sinusoidal_pe(
+    len: usize,
+    d_model: usize,
+    device: &Device,
+) -> candle_core::Result<Tensor> {
+    sinusoidal_pe_range(0, len, d_model, device)
+}
+
+/// Sinusoidal positional encoding for absolute positions
+/// `start .. start + len`, shape `[1, len, d_model]` (WeNet
+/// `position_encoding(offset, size)`).
+fn sinusoidal_pe_range(
+    start: usize,
+    len: usize,
+    d_model: usize,
+    device: &Device,
+) -> candle_core::Result<Tensor> {
     let mut data = vec![0f32; len * d_model];
-    for pos in 0..len {
+    for (row, pos) in (start..start + len).enumerate() {
         for i in 0..d_model / 2 {
             let angle = pos as f32 / 10_000f32.powf(2.0 * i as f32 / d_model as f32);
-            data[pos * d_model + 2 * i] = angle.sin();
-            data[pos * d_model + 2 * i + 1] = angle.cos();
+            data[row * d_model + 2 * i] = angle.sin();
+            data[row * d_model + 2 * i + 1] = angle.cos();
         }
     }
     Tensor::from_vec(data, (1, len, d_model), device)
@@ -191,6 +209,29 @@ impl RelPositionAttention {
     /// `x`: `[batch, time, d]`, `pos_emb`: `[1, time, d]`,
     /// `mask`: additive `[time, time]`.
     fn forward(&self, x: &Tensor, pos_emb: &Tensor, mask: &Tensor) -> candle_core::Result<Tensor> {
+        let (out, _, _) = self.forward_cached(x, pos_emb, Some(mask), None)?;
+        Ok(out)
+    }
+
+    /// Cache-aware attention (WeNet streaming `forward` with `cache`).
+    ///
+    /// `x`: current chunk `[batch, time, d]`; `cache`: previous keys/values
+    /// `[batch, heads, cache_t, head_dim]` each, prepended to this chunk's
+    /// K/V; `pos_emb`: `[1, cache_t + time, d]` over the absolute positions
+    /// of the concatenated keys; `mask`: optional additive
+    /// `[time, cache_t + time]` (streaming passes `None`: the cache is
+    /// already trimmed to the allowed left context).
+    ///
+    /// Returns `(out, k, v)` where `k`/`v` are the *untrimmed* concatenated
+    /// keys/values `[batch, heads, cache_t + time, head_dim]` for the next
+    /// cache.
+    fn forward_cached(
+        &self,
+        x: &Tensor,
+        pos_emb: &Tensor,
+        mask: Option<&Tensor>,
+        cache: Option<(&Tensor, &Tensor)>,
+    ) -> candle_core::Result<(Tensor, Tensor, Tensor)> {
         let (b, t, _) = x.dims3()?;
         let split = |x: Tensor, b: usize, t: usize| -> candle_core::Result<Tensor> {
             x.reshape((b, t, self.num_heads, self.head_dim))?
@@ -198,24 +239,34 @@ impl RelPositionAttention {
                 .contiguous()
         };
         let q = split(self.linear_q.forward(x)?, b, t)?; // [b, h, t, d_k]
-        let k = split(self.linear_k.forward(x)?, b, t)?;
-        let v = split(self.linear_v.forward(x)?, b, t)?;
-        let p = split(self.linear_pos.forward(pos_emb)?, 1, t)?; // [1, h, t, d_k]
+        let mut k = split(self.linear_k.forward(x)?, b, t)?;
+        let mut v = split(self.linear_v.forward(x)?, b, t)?;
+        if let Some((ck, cv)) = cache {
+            k = Tensor::cat(&[ck, &k], 2)?;
+            v = Tensor::cat(&[cv, &v], 2)?;
+        }
+        let t_key = k.dim(2)?;
+        let p = split(self.linear_pos.forward(pos_emb)?, 1, t_key)?; // [1, h, t_key, d_k]
 
         let bias = |bias: &Tensor| bias.reshape((1, self.num_heads, 1, self.head_dim));
         let q_u = q.broadcast_add(&bias(&self.pos_bias_u)?)?;
         let q_v = q.broadcast_add(&bias(&self.pos_bias_v)?)?;
 
-        let ac = q_u.matmul(&k.transpose(2, 3)?)?; // [b, h, t, t]
-        let bd = q_v.broadcast_matmul(&p.transpose(2, 3)?)?; // [b, h, t, t]
+        let ac = q_u.matmul(&k.transpose(2, 3)?)?; // [b, h, t, t_key]
+        let bd = q_v.broadcast_matmul(&p.transpose(2, 3)?)?; // [b, h, t, t_key]
         let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let scores = ((ac + bd)? * scale)?.broadcast_add(mask)?;
+        let scores = ((ac + bd)? * scale)?;
+        let scores = match mask {
+            Some(mask) => scores.broadcast_add(mask)?,
+            None => scores,
+        };
         let weights = candle_nn::ops::softmax(&scores, D::Minus1)?;
-        let out = weights
-            .matmul(&v)?
-            .transpose(1, 2)?
-            .reshape((b, t, self.num_heads * self.head_dim))?;
-        self.linear_out.forward(&out)
+        let out =
+            weights
+                .matmul(&v)?
+                .transpose(1, 2)?
+                .reshape((b, t, self.num_heads * self.head_dim))?;
+        Ok((self.linear_out.forward(&out)?, k, v))
     }
 }
 
@@ -277,7 +328,11 @@ impl ConvolutionModule {
                 vb.pp("norm"),
             )?)
         } else {
-            ConvNorm::Batch(batch_norm(d_model, BatchNormConfig::default(), vb.pp("norm"))?)
+            ConvNorm::Batch(batch_norm(
+                d_model,
+                BatchNormConfig::default(),
+                vb.pp("norm"),
+            )?)
         };
         Ok(Self {
             pointwise_conv1: conv1d(
@@ -303,20 +358,53 @@ impl ConvolutionModule {
 
     /// `x`: `[batch, time, d]`.
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        let x = x.transpose(1, 2)?; // [b, d, t]
+        if self.causal {
+            let (out, _) = self.forward_cached(x, None)?;
+            return Ok(out);
+        }
         // WeNet pads the module INPUT, before pointwise_conv1/GLU. Padding
         // after the GLU is not equivalent: pointwise_conv1 has a bias, so
         // the padded zeros become non-zero before the depthwise conv.
+        let x = x.transpose(1, 2)?; // [b, d, t]
         let (b, d, _) = x.dims3()?;
-        let x = if self.causal {
-            // Causal left padding keeps the module streamable.
-            let pad = Tensor::zeros((b, d, self.kernel - 1), x.dtype(), x.device())?;
-            Tensor::cat(&[pad, x], 2)?
-        } else {
-            let pad = Tensor::zeros((b, d, (self.kernel - 1) / 2), x.dtype(), x.device())?;
-            Tensor::cat(&[pad.clone(), x, pad], 2)?
+        let pad = Tensor::zeros((b, d, (self.kernel - 1) / 2), x.dtype(), x.device())?;
+        let x = Tensor::cat(&[pad.clone(), x, pad], 2)?;
+        self.conv_stack(&x)?.transpose(1, 2)
+    }
+
+    /// Streaming causal path (WeNet `ConvolutionModule.forward` with
+    /// `cache`): `x` `[batch, time, d]`, `cache` the previous module input
+    /// `[batch, d, kernel - 1]` (zeros on the first chunk).
+    ///
+    /// Returns `(out [batch, time, d], new_cache [batch, d, kernel - 1])` —
+    /// the cache is the raw input to `pointwise_conv1`, exactly as WeNet
+    /// stores it.
+    fn forward_cached(
+        &self,
+        x: &Tensor,
+        cache: Option<&Tensor>,
+    ) -> candle_core::Result<(Tensor, Tensor)> {
+        debug_assert!(self.causal, "conv cache requires the causal path");
+        let x = x.transpose(1, 2)?; // [b, d, t]
+        let (b, d, _) = x.dims3()?;
+        let lorder = self.kernel - 1;
+        let x = match cache {
+            Some(cache) => Tensor::cat(&[cache, &x], 2)?,
+            None => {
+                let pad = Tensor::zeros((b, d, lorder), x.dtype(), x.device())?;
+                Tensor::cat(&[pad, x], 2)?
+            }
         };
-        let x = self.pointwise_conv1.forward(&x)?;
+        let padded = x.dim(2)?;
+        let new_cache = x.narrow(2, padded - lorder, lorder)?;
+        let out = self.conv_stack(&x)?.transpose(1, 2)?;
+        Ok((out, new_cache))
+    }
+
+    /// pointwise_conv1 → GLU → depthwise → norm → SiLU → pointwise_conv2 on
+    /// an already-padded `[batch, d, time]` input.
+    fn conv_stack(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        let x = self.pointwise_conv1.forward(x)?;
         // GLU over the channel dim.
         let halves = x.chunk(2, 1)?;
         let x = halves[0].mul(&candle_nn::ops::sigmoid(&halves[1])?)?;
@@ -325,8 +413,7 @@ impl ConvolutionModule {
             ConvNorm::Layer(ln) => ln.forward(&x.transpose(1, 2)?)?.transpose(1, 2)?,
             ConvNorm::Batch(bn) => bn.forward_t(&x, false)?,
         };
-        let x = self.pointwise_conv2.forward(&x.silu()?)?;
-        x.transpose(1, 2)
+        self.pointwise_conv2.forward(&x.silu()?)
     }
 }
 
@@ -414,6 +501,89 @@ impl ConformerBlock {
                 .affine(0.5, 0.0)?)?;
         self.norm_final.forward(&x)
     }
+
+    /// Streaming forward with per-layer caches (WeNet
+    /// `ConformerEncoderLayer.forward` with `att_cache` / `cnn_cache`).
+    ///
+    /// `x`: current chunk `[batch, time, d]`; `pos_emb`:
+    /// `[1, cache_t + time, d]`; caches as in
+    /// [`RelPositionAttention::forward_cached`] /
+    /// [`ConvolutionModule::forward_cached`]. Always uses the causal
+    /// (streaming) convolution path.
+    ///
+    /// Returns `(out, (k, v), cnn_cache)` — the untrimmed attention K/V and
+    /// the next conv cache.
+    #[allow(clippy::type_complexity)]
+    fn forward_cached(
+        &self,
+        x: &Tensor,
+        pos_emb: &Tensor,
+        att_cache: Option<(&Tensor, &Tensor)>,
+        cnn_cache: Option<&Tensor>,
+    ) -> candle_core::Result<(Tensor, (Tensor, Tensor), Tensor)> {
+        let x = (x + self
+            .feed_forward_macaron
+            .forward(&self.norm_ff_macaron.forward(x)?)?
+            .affine(0.5, 0.0)?)?;
+        let (att, k, v) =
+            self.self_attn
+                .forward_cached(&self.norm_mha.forward(&x)?, pos_emb, None, att_cache)?;
+        let x = (&x + att)?;
+        let (conv, new_cnn) = self
+            .conv_module
+            .forward_cached(&self.norm_conv.forward(&x)?, cnn_cache)?;
+        let x = (&x + conv)?;
+        let x = (&x
+            + self
+                .feed_forward
+                .forward(&self.norm_ff.forward(&x)?)?
+                .affine(0.5, 0.0)?)?;
+        Ok((self.norm_final.forward(&x)?, (k, v), new_cnn))
+    }
+}
+
+/// Incremental state for [`FastU2pp::forward_chunk`] — the Rust equivalent
+/// of WeNet's `forward_chunk_by_chunk` loop state (`att_cache`, `cnn_cache`,
+/// `offset`) plus the raw-fbank window buffering.
+///
+/// Create with [`FastU2pp::stream`]; feed fbank frames with
+/// [`FastU2pp::forward_chunk`].
+#[derive(Debug)]
+pub struct FastU2ppStream {
+    /// Per-layer attention cache `(K, V)`, each
+    /// `[batch, heads, cache_t, head_dim]` with `cache_t <=
+    /// left_chunks * chunk_frames`.
+    att_cache: Vec<Option<(Tensor, Tensor)>>,
+    /// Per-layer depthwise-conv left context `[batch, d_model, kernel - 1]`.
+    cnn_cache: Vec<Option<Tensor>>,
+    /// Raw fbank frames not yet consumed by a full window
+    /// `[batch, n, n_mels]`.
+    fbank_buf: Option<Tensor>,
+    /// Absolute subsampled-frame position of the next output frame.
+    offset: usize,
+}
+
+impl FastU2ppStream {
+    fn new(num_layers: usize) -> Self {
+        Self {
+            att_cache: vec![None; num_layers],
+            cnn_cache: vec![None; num_layers],
+            fbank_buf: None,
+            offset: 0,
+        }
+    }
+
+    /// Resets the stream to its initial (empty) state.
+    pub fn reset(&mut self) {
+        for kv in &mut self.att_cache {
+            *kv = None;
+        }
+        for c in &mut self.cnn_cache {
+            *c = None;
+        }
+        self.fbank_buf = None;
+        self.offset = 0;
+    }
 }
 
 /// The Fast-U2++ conformer encoder.
@@ -480,7 +650,13 @@ impl FastU2pp {
     #[doc(hidden)]
     pub fn debug_layer0(&self, x: &Tensor, pos_emb: &Tensor) -> Result<Tensor> {
         let t = x.dim(1)?;
-        let mask = frc::layer_mask(t, self.cfg.chunk_frames, self.cfg.left_chunks.min(t), 0, x.device())?;
+        let mask = frc::layer_mask(
+            t,
+            self.cfg.chunk_frames,
+            self.cfg.left_chunks.min(t),
+            0,
+            x.device(),
+        )?;
         Ok(self.encoders[0].forward(x, pos_emb, &mask)?)
     }
 
@@ -506,6 +682,110 @@ impl FastU2pp {
         for block in &self.encoders {
             x = block.forward(&x, &pos_emb, &mask)?;
         }
+        Ok(self.after_norm.forward(&x)?)
+    }
+
+    /// Raw fbank frames consumed per streaming window
+    /// (`(chunk_frames - 1) * subsampling + context`, WeNet's
+    /// `decoding_window`).
+    fn window_frames(&self) -> usize {
+        (self.cfg.chunk_frames - 1) * 4 + 7
+    }
+
+    /// Creates an empty incremental-decoding state for [`Self::forward_chunk`].
+    pub fn stream(&self) -> FastU2ppStream {
+        FastU2ppStream::new(self.cfg.num_layers)
+    }
+
+    /// Incremental streaming forward (WeNet `forward_chunk_by_chunk`,
+    /// issue #9): pushes new fbank frames `[batch, n, n_mels]` into the
+    /// stream and returns any BNF frames that became ready,
+    /// `[batch, chunk_frames * windows, d_model]` (or `None` when fewer
+    /// than one full window is buffered).
+    ///
+    /// Each window consumes `(chunk_frames - 1) * 4 + 7` raw frames with a
+    /// stride of `4 * chunk_frames` and yields `chunk_frames` subsampled
+    /// frames; attention runs over the per-layer K/V cache of the last
+    /// `left_chunks * chunk_frames` frames plus the current chunk, and the
+    /// depthwise convs carry a `kernel - 1` frame left context — output is
+    /// identical to the mask-based [`Self::forward`] but with O(chunk)
+    /// per-call cost. Always uses the causal (streaming) conv path.
+    pub fn forward_chunk(
+        &self,
+        features: &Tensor,
+        state: &mut FastU2ppStream,
+    ) -> Result<Option<Tensor>> {
+        if self.cfg.dual_conv_streaming == Some(false) {
+            return Err(Error::Input(
+                "forward_chunk streams with the causal conv path; \
+                 dual_conv_streaming = Some(false) selects the non-causal one"
+                    .into(),
+            ));
+        }
+        let mut buf = match state.fbank_buf.take() {
+            Some(buf) => Tensor::cat(&[&buf, features], 1)?,
+            None => features.clone(),
+        };
+        let window = self.window_frames();
+        let stride = 4 * self.cfg.chunk_frames;
+        let mut outs = Vec::new();
+        while buf.dim(1)? >= window {
+            let xs = buf.narrow(1, 0, window)?;
+            outs.push(self.forward_window(&xs, state)?);
+            let remaining = buf.dim(1)? - stride;
+            buf = buf.narrow(1, stride, remaining)?;
+        }
+        state.fbank_buf = Some(buf);
+        if outs.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(Tensor::cat(&outs.iter().collect::<Vec<_>>(), 1)?))
+    }
+
+    /// Runs one full window (WeNet `forward_chunk`): `xs`
+    /// `[batch, window_frames, n_mels]` → `[batch, chunk_frames, d_model]`,
+    /// updating the per-layer caches and the position offset.
+    fn forward_window(&self, xs: &Tensor, state: &mut FastU2ppStream) -> Result<Tensor> {
+        let xs = match &self.cmvn {
+            Some((mean, istd)) => xs.broadcast_sub(mean)?.broadcast_mul(istd)?,
+            None => xs.clone(),
+        };
+        let x = self.embed.forward(&xs)?;
+        let chunk = x.dim(1)?;
+        let mut x = x.affine((self.cfg.d_model as f64).sqrt(), 0.0)?;
+
+        let cache_t1 = match &state.att_cache[0] {
+            Some((k, _)) => k.dim(2)?,
+            None => 0,
+        };
+        let key_len = cache_t1 + chunk;
+        // Absolute positions of the concatenated keys:
+        // offset - cache_t1 .. offset + chunk.
+        let pos_emb = sinusoidal_pe_range(
+            state.offset - cache_t1,
+            key_len,
+            self.cfg.d_model,
+            x.device(),
+        )?;
+        // Trim the next attention cache to the allowed left context
+        // (WeNet `required_cache_size`); unlimited left context keeps all.
+        let next_cache_start = match self.cfg.left_chunks {
+            usize::MAX => 0,
+            left => key_len.saturating_sub(left * self.cfg.chunk_frames),
+        };
+        for (i, block) in self.encoders.iter().enumerate() {
+            let att = state.att_cache[i].as_ref().map(|(k, v)| (k, v));
+            let cnn = state.cnn_cache[i].as_ref();
+            let (out, (k, v), new_cnn) = block.forward_cached(&x, &pos_emb, att, cnn)?;
+            let keep = key_len - next_cache_start;
+            state.att_cache[i] = Some((
+                k.narrow(2, next_cache_start, keep)?,
+                v.narrow(2, next_cache_start, keep)?,
+            ));
+            state.cnn_cache[i] = Some(new_cnn);
+            x = out;
+        }
+        state.offset += chunk;
         Ok(self.after_norm.forward(&x)?)
     }
 }
@@ -614,5 +894,90 @@ mod tests {
     fn rejects_wrong_sample_rate() {
         let model = tiny();
         assert!(model.extract(&[0.0; 8000], 44_100).is_err());
+    }
+
+    fn tiny_with(left_chunks: usize, dual: Option<bool>) -> FastU2pp {
+        let cfg = FastU2ppConfig {
+            n_mels: 20,
+            d_model: 32,
+            num_heads: 2,
+            ff_dim: 48,
+            num_layers: 2,
+            cnn_kernel: 7,
+            chunk_frames: 2,
+            left_chunks,
+            dual_conv_streaming: dual,
+            cmvn: false,
+            sample_rate: 16_000,
+        };
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu);
+        FastU2pp::new(cfg, vb).unwrap()
+    }
+
+    /// Feeds `feats` to `forward_chunk` in pieces of `feed` raw frames and
+    /// concatenates everything the stream emits.
+    fn stream_all(model: &FastU2pp, feats: &Tensor, feed: usize) -> Tensor {
+        let mut state = model.stream();
+        let mut outs = Vec::new();
+        let n = feats.dim(1).unwrap();
+        let mut cur = 0;
+        while cur < n {
+            let take = feed.min(n - cur);
+            let chunk = feats.narrow(1, cur, take).unwrap();
+            cur += take;
+            if let Some(bn) = model.forward_chunk(&chunk, &mut state).unwrap() {
+                outs.push(bn);
+            }
+        }
+        Tensor::cat(&outs.iter().collect::<Vec<_>>(), 1).unwrap()
+    }
+
+    fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
+        (a - b)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar()
+            .unwrap()
+    }
+
+    #[test]
+    fn forward_chunk_matches_masked_forward() {
+        // Incremental streaming with att K/V + conv caches must reproduce
+        // the mask-based full-utterance forward exactly (same attention
+        // pattern, same causal convs, same absolute positions).
+        let dev = Device::Cpu;
+        for (left_chunks, dual) in [(2, None), (2, Some(true)), (usize::MAX, None)] {
+            let model = tiny_with(left_chunks, dual);
+            let feats = Tensor::randn(0f32, 1f32, (1, 83, 20), &dev).unwrap();
+            let offline = model.forward(&feats).unwrap(); // 20 subsampled frames
+                                                          // chunk_frames = 2 -> window 11 raw frames, stride 8.
+            let streamed = stream_all(&model, &feats, 8);
+            let t = streamed.dim(1).unwrap().min(offline.dim(1).unwrap());
+            assert!(t >= 18, "stream emitted too few frames: {t}");
+            let a = offline.narrow(1, 0, t).unwrap();
+            let b = streamed.narrow(1, 0, t).unwrap();
+            let diff = max_abs_diff(&a, &b);
+            assert!(
+                diff < 1e-4,
+                "streaming/offline mismatch {diff} (left_chunks={left_chunks}, dual={dual:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn forward_chunk_is_invariant_to_feed_size() {
+        // The internal fbank buffering must make the output independent of
+        // how the caller slices the feature stream.
+        let dev = Device::Cpu;
+        let model = tiny_with(2, None);
+        let feats = Tensor::randn(0f32, 1f32, (1, 60, 20), &dev).unwrap();
+        let a = stream_all(&model, &feats, 5);
+        let b = stream_all(&model, &feats, 32);
+        assert_eq!(a.dims(), b.dims());
+        assert!(max_abs_diff(&a, &b) < 1e-6);
     }
 }
