@@ -1,8 +1,10 @@
 # X-VC
 
-> **Ported and working (quality parity verified); not yet real-time on
-> CPU.** Notes for **X-VC: Zero-shot Streaming Voice Conversion in Codec
-> Space** ([arXiv:2604.12456](https://arxiv.org/abs/2604.12456), Zheng et
+> **Ported and working (quality parity verified); real-time on an idle
+> 8-thread CPU (pipelined driver) and on GPU (`--features cuda`, RTF
+> ≈ 0.10) — CPU under desktop co-load still falls behind, tracked in
+> [#38](https://github.com/m96-chan/babiniku.rs/issues/38).** Notes for
+> **X-VC: Zero-shot Streaming Voice Conversion in Codec Space** ([arXiv:2604.12456](https://arxiv.org/abs/2604.12456), Zheng et
 > al., 2026), ported to `crates/xvc` in
 > [#30](https://github.com/m96-chan/babiniku.rs/issues/30) — see
 > [Status](#status) for measured parity and performance.
@@ -80,9 +82,9 @@ Streaming behavior is controlled by the official repo's `chunk` / `current` /
 
 - **Model-induced latency 240 ms** = 120 ms current segment + 20 ms overlap +
   100 ms future context; **computation latency 58.17 ms** (encode + convert +
-  decode). Measured locally (Phase 0): GPU trivially real-time (RTF 0.18);
-  CPU needs the 640/240 preset and is not yet real-time in the Rust port —
-  see [Status](#status).
+  decode). Measured locally: GPU trivially real-time (Rust cuda build RTF
+  ≈ 0.10); CPU needs the 640/240 preset plus the pipelined driver and an
+  otherwise-idle box — see [Status](#status).
 - Offline **RTF 0.014** (vs. Seed-VC tiny 0.069, MeanVC 0.094, same setup).
 - Streaming: SIM 0.62 (EN) / 0.72 (ZH), WER 3.14 % (EN) / 2.65 % (ZH),
   UTMOS 3.07 (EN) / 2.35 (ZH); SMOS 3.98 (EN) / 3.89 (ZH).
@@ -122,27 +124,39 @@ Usage:
   `ckpt/xvc_{tokenizer,speaker,codec,converter,prenet}.safetensors`
   (~2.1 GiB fp32 total).
 
-**Performance (CPU, 8 threads, fp32)** — the honest caveat:
+**Performance (fp32, 640/240/100/20 streaming preset)** — issue
+[#38](https://github.com/m96-chan/babiniku.rs/issues/38) status:
 
-| mode | measured | budget |
+| mode | measured | late |
 |---|---|---|
-| offline | RTF **0.69** | — |
-| streaming 640/240/100/20 | ≈ 425 ms/hop → RTF **≈ 1.75** (semantic 0.50 / convert 0.66 / decode 0.61) | 240 ms |
+| offline (CPU 8 threads) | RTF **0.69** | — |
+| streaming, serial driver (CPU 8 threads) | Σ ≈ 1.75 (semantic 0.50 / convert 0.66 / decode 0.61) | every hop |
+| streaming, **pipelined** driver (CPU 8 threads, idle box) | bottleneck stage ≈ **0.92** (stages overlap on 3 threads) | **0** sustained |
+| streaming, pipelined (CPU, desktop co-load ≈ 4 cores) | bottleneck ≈ 1.0 | ⚠️ hops go late |
+| streaming (**GPU**, `--features cuda`, RTX 5090) | RTF ≈ **0.10** (semantic 0.06 / convert 0.04 / decode 0.01) | **0**, incl. under desktop load |
 
-The official PyTorch driver reaches RTF 0.72 on the same box, so the gap is
-per-op speed (candle conv/attention fp32), not the driver. **Streaming is
-not yet real-time on CPU**; the demo runs but falls behind (every hop
-late). Phase-2 levers, in order: q8 quantization of the Whisper encoder +
-codec decoder (~60 % of compute), incremental caching (causal convs +
-block-causal attention make the tokenizer cacheable; the DAC encoder is
-fully convolutional), stage pipelining across threads. On GPU the official
-preset is trivially real-time (recon: RTF 0.18).
+`XvcPipelinedStream` runs the three window stages on dedicated threads
+(bit-identical output to the serial driver; on accelerators it degrades
+to a single worker thread — concurrent candle op submission from several
+host threads corrupts results, and GPU kernels serialize on one stream
+anyway). The cuda build needs the depthwise-conv fast path in
+`xvc::tokenizer` (candle's grouped conv1d launches one kernel per
+channel). CPU remains the zero-setup default; **on a busy desktop the CPU
+margin is not enough for the live mic** — use the cuda build there, or
+wait for the causal-caching redesign (#38): bit-close caching of the
+official windowed driver is blocked by the tokenizer's window-relative
+positional embeddings, so the remaining CPU headroom requires a
+numerics-changing causal semantic branch (quality re-validation needed).
+q8 quantization is off the table per the maintainer (fp32 only).
 
 - [x] Official pipeline reproduced (offline + streaming)
 - [x] Japanese source/target quality assessed — **PASS** (identical ASR
       transcript offline, target F0 locked in all pairs incl. cross-gender)
-- [x] CPU real-time feasibility — offline yes (0.69), streaming not yet
-      (≈ 1.75 @ 8 threads); Phase-2 optimization tracked in #30
+- [x] CPU real-time feasibility — offline yes (0.69); streaming yes on an
+      idle 8-thread box (pipelined driver, late 0), not yet under desktop
+      co-load (#38)
+- [x] GPU real-time — `-p vc-demo --features cuda`: RTF ≈ 0.10, late 0
+      under load (CUDA 13.3, sm_120)
 - [x] Streaming-parameter sweep — 640 ms window / 240 ms hop chosen as the
       CPU preset (quality holds; official 2400/120 preset available via
       `StreamConfig::official()`)
