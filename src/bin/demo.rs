@@ -62,7 +62,7 @@ struct Stats {
 
 struct Args {
     reference: String,
-    voice_print: String,
+    voice_print: Option<String>,
     wav: Option<String>,
     out: Option<String>,
     headless: bool,
@@ -74,7 +74,7 @@ struct Args {
 fn parse_args() -> Args {
     let mut a = Args {
         reference: "ckpt/test.wav".into(),
-        voice_print: "ckpt/voice_print_test.safetensors".into(),
+        voice_print: None,
         wav: None,
         out: None,
         headless: false,
@@ -86,7 +86,7 @@ fn parse_args() -> Args {
     while let Some(f) = it.next() {
         match f.as_str() {
             "--reference" => a.reference = it.next().expect("--reference <wav>"),
-            "--voice-print" => a.voice_print = it.next().expect("--voice-print <safetensors>"),
+            "--voice-print" => a.voice_print = Some(it.next().expect("--voice-print <safetensors>")),
             "--wav" => a.wav = Some(it.next().expect("--wav <file>")),
             "--out" => a.out = Some(it.next().expect("--out <file>")),
             "--headless" => a.headless = true,
@@ -194,28 +194,30 @@ fn read_wav_16k(path: &str) -> anyhow::Result<Vec<f32>> {
     Ok(s.into_iter().step_by(spec.channels as usize).collect())
 }
 
-/// Voice print: precomputed safetensors if present, otherwise (feature
-/// "wavlm") computed natively from the reference audio via the ONNX
-/// WavLM-Large SV model at ckpt/wavlm_sv.onnx.
+/// Voice print: an explicitly passed safetensors file, otherwise (feature
+/// "wavlm") computed natively FROM THE REFERENCE AUDIO via the ONNX
+/// WavLM-Large SV model at ckpt/wavlm_sv.onnx. There is deliberately no
+/// file fallback: a stale precomputed voice print of a different speaker
+/// silently overrides the reference timbre.
 fn load_voice_print(args: &Args, reference: &[f32], device: &Device) -> anyhow::Result<Tensor> {
-    if std::path::Path::new(&args.voice_print).exists() {
-        let vp = candle_core::safetensors::load(&args.voice_print, device)?;
+    if let Some(path) = &args.voice_print {
+        let vp = candle_core::safetensors::load(path, device)
+            .map_err(|e| anyhow::anyhow!("cannot read --voice-print {path}: {e}"))?;
         return vp
             .get("voice_print")
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("voice_print tensor missing in {}", args.voice_print));
+            .ok_or_else(|| anyhow::anyhow!("voice_print tensor missing in {path}"));
     }
     #[cfg(feature = "wavlm")]
     {
         use meanvc2::encoders::SpeakerEncoder;
-        eprintln!("voice-print file not found; computing with WavLM (ckpt/wavlm_sv.onnx)…");
+        eprintln!("computing voice print from the reference audio (WavLM, ckpt/wavlm_sv.onnx)…");
         let sv = meanvc2::backends::WavLmSv::load("ckpt/wavlm_sv.onnx")?;
         Ok(sv.embed(reference, SR)?)
     }
     #[cfg(not(feature = "wavlm"))]
     anyhow::bail!(
-        "voice-print file {} not found; either precompute it or rebuild with --features demo,wavlm",
-        args.voice_print
+        "no --voice-print given and the "wavlm" feature is off; pass a precomputed          voice print or rebuild with --features demo,wavlm"
     )
 }
 
