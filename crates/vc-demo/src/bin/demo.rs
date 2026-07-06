@@ -165,6 +165,9 @@ struct Args {
     gate_db: i32,
     headless: bool,
     no_sink: bool,
+    /// Disable the cross-window needle check (saves one hop = 240 ms of
+    /// latency, at the cost of occasional decoder needle ticks).
+    low_latency: bool,
     monitor: bool,
     denoise: bool,
     duration: Option<f32>,
@@ -186,6 +189,7 @@ fn parse_args() -> Args {
         gate_db: -45,
         headless: false,
         no_sink: false,
+        low_latency: false,
         monitor: false,
         denoise: false,
         duration: None,
@@ -211,6 +215,7 @@ fn parse_args() -> Args {
             "--wav" => a.wav = Some(it.next().expect("--wav <file>")),
             "--out" => a.out = Some(it.next().expect("--out <file>")),
             "--headless" => a.headless = true,
+            "--low-latency" => a.low_latency = true,
             "--cpu" => a.cpu = true,
             "--no-sink" => a.no_sink = true,
             "--monitor" => a.monitor = true,
@@ -692,8 +697,16 @@ fn run_xvc_conversion(
     stats: Arc<Mutex<Stats>>,
     run: Arc<AtomicBool>,
     controls: Arc<Controls>,
+    cross_check: bool,
 ) -> anyhow::Result<()> {
-    let cfg = xvc::StreamConfig::default();
+    // Cross-window needle suppression is on unless --low-latency: it
+    // holds each hop until the next window has re-rendered the same
+    // region (+240 ms), which is what finally kills the decoder needle
+    // ticks that amplitude heuristics can only chase (issue #42).
+    let cfg = xvc::StreamConfig {
+        cross_check,
+        ..Default::default()
+    };
     let hop = cfg.current_ms as f32 / 1000.0;
     let mut stream = xvc::XvcPipelinedStream::new(engine.clone(), reference.clone(), cfg)?;
     let mut hp = HighpassBiquad::new(SR as f64, 40.0);
@@ -737,6 +750,7 @@ fn run_xvc_conversion(
                 st.rtf_vc = t.acoustic.as_secs_f32() / hop;
                 st.rtf_voc = t.decode.as_secs_f32() / hop;
                 st.out_rms = rms(&step.samples);
+                st.declicks += step.cross_repairs as u64;
                 if now > due + Duration::from_secs_f32(hop) {
                     if *emitted >= WARMUP_HOPS {
                         st.late += 1;
@@ -1199,6 +1213,7 @@ fn main() -> anyhow::Result<()> {
     let stats_vc = stats.clone();
     let run_vc = run.clone();
     let controls_vc = controls.clone();
+    let xvc_cross_check = !args.low_latency;
     let vc = std::thread::spawn(move || -> anyhow::Result<()> {
         let (model, asr, prompt_mel, spks) = match models {
             Models::Xvc {
@@ -1214,6 +1229,7 @@ fn main() -> anyhow::Result<()> {
                     stats_vc,
                     run_vc,
                     controls_vc,
+                    xvc_cross_check,
                 );
             }
             Models::MeanVc {
