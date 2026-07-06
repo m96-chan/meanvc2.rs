@@ -588,10 +588,11 @@ enum Models {
 /// waveform (the engine decodes to waveform itself, so there is no
 /// separate vocoder stage). A hop counts as **late** when it is emitted
 /// more than one hop-period after its schedule slot (first emitted hop +
-/// k·hop), i.e. when it would underrun a one-hop jitter buffer — the
-/// sustained-real-time criterion under pipelining (steady-state pipeline
-/// latency sits ~100 ms above the first, contention-free hop; unbounded
-/// drift, not the constant offset, is what breaks live playback).
+/// k·hop), i.e. when it would underrun a one-hop jitter buffer; the
+/// schedule then re-anchors, so one transient stall counts once instead
+/// of permanently flagging every later hop (steady-state pipeline latency
+/// sits ~100 ms above the first, contention-free hop; unbounded drift,
+/// not a constant offset, is what breaks live playback).
 /// Microphone input is preprocessed incrementally (sliding-percentile
 /// volume normalization + streaming 40 Hz high-pass); wav input arrives
 /// already preprocessed offline.
@@ -642,6 +643,12 @@ fn run_xvc_conversion(
                 st.out_rms = rms(&step.samples);
                 if now > due + Duration::from_secs_f32(hop) {
                     st.late += 1;
+                    // Jitter-buffer semantics: one underrun event counts
+                    // once, then the schedule re-anchors to the recovered
+                    // timeline. A fixed anchor would flag every subsequent
+                    // hop after a single transient stall, turning the
+                    // counter into a permanent +1/hop tally.
+                    *anchor = Some(now - Duration::from_secs_f64(*emitted as f64 * hop as f64));
                 }
             }
             *emitted += 1;
