@@ -13,7 +13,10 @@
 //! Keys: `q` quit · `p` passthrough (bypass conversion for A/B) ·
 //! `l` loopback monitor (hear the converted voice on the default output).
 //!
-//! Options: `--wav <file>` converts a wav file instead of the microphone
+//! Options: `--denoise` inserts PipeWire's WebRTC noise suppression in
+//! front of the microphone (recommended for noisy mics),
+//! `--input-device <source>` records from a specific PulseAudio source,
+//! `--wav <file>` converts a wav file instead of the microphone
 //! (paced in real time), `--headless` disables the TUI, `--out <file>`
 //! additionally records the converted audio, `--no-sink` skips creating
 //! the virtual device, `--monitor` starts with the loopback enabled,
@@ -65,9 +68,11 @@ struct Args {
     voice_print: Option<String>,
     wav: Option<String>,
     out: Option<String>,
+    input_device: Option<String>,
     headless: bool,
     no_sink: bool,
     monitor: bool,
+    denoise: bool,
     duration: Option<f32>,
 }
 
@@ -77,9 +82,11 @@ fn parse_args() -> Args {
         voice_print: None,
         wav: None,
         out: None,
+        input_device: None,
         headless: false,
         no_sink: false,
         monitor: false,
+        denoise: false,
         duration: None,
     };
     let mut it = std::env::args().skip(1);
@@ -92,6 +99,8 @@ fn parse_args() -> Args {
             "--headless" => a.headless = true,
             "--no-sink" => a.no_sink = true,
             "--monitor" => a.monitor = true,
+            "--denoise" => a.denoise = true,
+            "--input-device" => a.input_device = Some(it.next().expect("--input-device <source>")),
             "--duration" => a.duration = it.next().and_then(|s| s.parse().ok()),
             other => {
                 eprintln!("unknown flag {other}");
@@ -128,6 +137,32 @@ fn create_virtual_device() -> anyhow::Result<Vec<String>> {
         "source_properties=device.description=MeanVC-Virtual-Mic",
     ])?;
     Ok(vec![sink, mic])
+}
+
+const DENOISED_SRC: &str = "meanvc_denoised";
+
+/// PipeWire/Pulse WebRTC noise suppression in front of the microphone:
+/// creates a cleaned source the input thread records from. Returns the
+/// pactl module id.
+fn create_denoiser(master: Option<&str>) -> anyhow::Result<String> {
+    let mut cmd = Command::new("pactl");
+    cmd.args([
+        "load-module",
+        "module-echo-cancel",
+        &format!("source_name={DENOISED_SRC}"),
+        "aec_method=webrtc",
+        "source_properties=device.description=MeanVC-Denoised-Input",
+    ]);
+    if let Some(m) = master {
+        cmd.arg(format!("source_master={m}"));
+    }
+    let out = cmd.output()?;
+    anyhow::ensure!(
+        out.status.success(),
+        "pactl module-echo-cancel failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 /// Loopback monitor: routes the converted audio to the default output so
@@ -260,12 +295,19 @@ fn main() -> anyhow::Result<()> {
     let prompt_mel = MelV1::new().compute(&reference, &device)?.unsqueeze(0)?;
     let spks = load_voice_print(&args, &reference, &device)?.unsqueeze(0)?;
 
-    let modules = if args.no_sink {
+    let mut modules = if args.no_sink {
         Vec::new()
     } else {
         create_virtual_device()?
     };
     let sink_ok = !modules.is_empty();
+    // Optional noise suppression in front of the mic.
+    let capture_device: Option<String> = if args.denoise && args.wav.is_none() {
+        modules.push(create_denoiser(args.input_device.as_deref())?);
+        Some(DENOISED_SRC.to_string())
+    } else {
+        args.input_device.clone()
+    };
     let monitor = Arc::new(Monitor(Mutex::new(None)));
     if args.monitor && sink_ok {
         monitor.toggle()?;
@@ -287,6 +329,7 @@ fn main() -> anyhow::Result<()> {
     let (tx_in, rx_in) = std::sync::mpsc::sync_channel::<Vec<f32>>(8);
     let run_in = run.clone();
     let wav_src = args.wav.clone();
+    let capture_device = capture_device.clone();
     let input = std::thread::spawn(move || -> anyhow::Result<()> {
         match wav_src {
             Some(path) => {
@@ -314,7 +357,7 @@ fn main() -> anyhow::Result<()> {
                     None,
                     "meanvc-demo",
                     Direction::Record,
-                    None,
+                    capture_device.as_deref(),
                     "capture",
                     &pulse_spec(),
                     None,
