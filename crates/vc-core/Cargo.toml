@@ -1,0 +1,20 @@
+[package]
+name = "vc-core"
+description = "Shared voice-conversion foundation for babiniku.rs: encoder/vocoder traits, audio front-end, error types"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["voice-conversion", "speech", "streaming", "audio", "candle"]
+categories = ["multimedia::audio", "science"]
+
+[dependencies]
+candle-core = { workspace = true }
+rustfft = { workspace = true }
+thiserror = { workspace = true }
+
+[features]
+default = []
+cuda = ["candle-core/cuda"]
+metal = ["candle-core/metal"]

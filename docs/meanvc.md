@@ -39,13 +39,13 @@ The original **MeanVC** (Ma et al., 2025) shares the recognition–synthesis ske
 
 | Module | Source | Paper section |
 |---|---|---|
-| FRC attention-mask scheduling | [`src/frc.rs`](src/frc.rs) | §3.2 |
-| Universal timbre token encoder | [`src/model/utte.rs`](src/model/utte.rs) | §3.3 |
-| DiT decoder (adaLN-Zero blocks) | [`src/model/dit.rs`](src/model/dit.rs), [`src/model/decoder.rs`](src/model/decoder.rs) | §3.1 |
-| Mean-flows loss & 1-NFE sampling | [`src/meanflow.rs`](src/meanflow.rs) | §2.1–2.2 |
-| Streaming chunk driver | [`src/streaming.rs`](src/streaming.rs) | §3.2 |
-| Log-mel front-end | [`src/audio/mel.rs`](src/audio/mel.rs) | §4.1 |
-| External-model traits | [`src/encoders.rs`](src/encoders.rs) | §3.1 |
+| FRC attention-mask scheduling | [`crates/meanvc/src/frc.rs`](../crates/meanvc/src/frc.rs) | §3.2 |
+| Universal timbre token encoder | [`crates/meanvc/src/model/utte.rs`](../crates/meanvc/src/model/utte.rs) | §3.3 |
+| DiT decoder (adaLN-Zero blocks) | [`crates/meanvc/src/model/dit.rs`](../crates/meanvc/src/model/dit.rs), [`crates/meanvc/src/model/decoder.rs`](../crates/meanvc/src/model/decoder.rs) | §3.1 |
+| Mean-flows loss & 1-NFE sampling | [`crates/meanvc/src/meanflow.rs`](../crates/meanvc/src/meanflow.rs) | §2.1–2.2 |
+| Streaming chunk driver | [`crates/meanvc/src/streaming.rs`](../crates/meanvc/src/streaming.rs) | §3.2 |
+| Log-mel front-end | [`crates/vc-core/src/audio/mel.rs`](../crates/vc-core/src/audio/mel.rs) | §4.1 |
+| External-model traits | [`crates/vc-core/src/encoders.rs`](../crates/vc-core/src/encoders.rs) | §3.1 |
 
 Default hyper-parameters follow §4.1 of the paper: 4 DiT blocks (hidden 512, 2 heads), 32 universal timbre tokens (hidden 256, 4-head cross-attention), 40 ms chunks on 16 kHz audio, and FRC receptive fields `P = [2, 2, 1, 1]`, `F = [1, 0, 0, 0]`.
 
@@ -53,15 +53,16 @@ Default hyper-parameters follow §4.1 of the paper: 4 DiT blocks (hidden 512, 2 
 
 ```toml
 [dependencies]
-meanvc2 = { git = "https://github.com/m96-chan/meanvc2.rs" }
+# package `meanvc`, library name `meanvc2` (use meanvc2::…)
+meanvc = { git = "https://github.com/m96-chan/babiniku.rs" }
 ```
 
-The crate currently builds against the [m96-chan/candle](https://github.com/m96-chan/candle) fork of candle (v0.11, `feat/forward-ad-jvp` branch), which adds the forward-mode AD used by the mean-flows objective.
+The crate lives in the `crates/meanvc` member of the babiniku.rs cargo workspace (shared traits/DSP in `crates/vc-core`, re-exported as `meanvc2::{audio, encoders, Error, Result}`). It currently builds against the [m96-chan/candle](https://github.com/m96-chan/candle) fork of candle (v0.11, `feat/forward-ad-jvp` branch), which adds the forward-mode AD used by the mean-flows objective.
 
 CUDA / Metal acceleration comes from candle's backends:
 
 ```sh
-cargo build --release --features cuda   # or --features metal
+cargo build --release -p meanvc --features cuda   # or --features metal
 ```
 
 ## Quick start
@@ -155,20 +156,20 @@ for (q, samples_200ms) in mic_chunks.enumerate() {
 }
 ```
 
-See `src/bin/demo.rs` for the complete real-time loop (gating, denoising, pitch shift, virtual mic) and `examples/convert_v1.rs` for the offline pipeline.
+See [`crates/vc-demo/src/bin/demo.rs`](../crates/vc-demo/src/bin/demo.rs) for the complete real-time loop (gating, denoising, pitch shift, virtual mic) and [`crates/meanvc/examples/convert_v1.rs`](../crates/meanvc/examples/convert_v1.rs) for the offline pipeline.
 
 ## Real-time TUI demo with a virtual microphone (Linux)
 
 `meanvc-demo` converts your microphone in real time and exposes the result as a **virtual microphone** (`MeanVC-Virtual-Mic`, via a PipeWire/PulseAudio null sink) selectable from any app:
 
 ```sh
-cargo run --release --features demo,wavlm --bin meanvc-demo -- \
+cargo run --release -p vc-demo --features wavlm --bin meanvc-demo -- \
     --reference target_voice.wav
 ```
 
 With the `wavlm` feature the 256-dim voice print is computed natively from the reference audio (export the ONNX model once with `tools/export_wavlm_onnx.py`); without it, pass a precomputed `--voice-print file.safetensors`.
 
-TUI shows level meters, per-stage RTF, and supports `p` (passthrough A/B), `l` (loopback monitor — hear the converted voice on your speakers), `[` / `]` (pitch shift ±0.5 semitone, Signalsmith Stretch after the vocoder — useful when the target F0 sits outside the model's training range), `,` / `.` (in-process RNNoise mix ±10 %), `q` (quit; removes the virtual device). `--monitor` starts with the loopback on. `--denoise` inserts PipeWire's WebRTC noise suppression in front of the microphone (recommended for noisy mics; `--input-device` selects a specific source). `--wav file.wav` streams a file instead of the mic, `--headless` / `--out out.wav` / `--duration N` support scripted runs. Requires the checkpoints under `ckpt/` (see `examples/convert_v1.rs`) and `pactl`. The ASR stage streams incrementally with `FastU2pp::forward_chunk` (per-layer attention K/V + conv caches, exact WeNet `forward_chunk` parity — issue #9). Measured with `RAYON_NUM_THREADS=8`: per-stage RTF ≈ 0.06 (ASR) / 0.04 (VC) / 0.06 (vocoder), late = 0 sustained.
+TUI shows level meters, per-stage RTF, and supports `p` (passthrough A/B), `l` (loopback monitor — hear the converted voice on your speakers), `[` / `]` (pitch shift ±0.5 semitone, Signalsmith Stretch after the vocoder — useful when the target F0 sits outside the model's training range), `,` / `.` (in-process RNNoise mix ±10 %), `q` (quit; removes the virtual device). `--monitor` starts with the loopback on. `--denoise` inserts PipeWire's WebRTC noise suppression in front of the microphone (recommended for noisy mics; `--input-device` selects a specific source). `--wav file.wav` streams a file instead of the mic, `--headless` / `--out out.wav` / `--duration N` support scripted runs. Requires the checkpoints under `ckpt/` at the workspace root (see `crates/meanvc/examples/convert_v1.rs`) and `pactl`. The ASR stage streams incrementally with `FastU2pp::forward_chunk` (per-layer attention K/V + conv caches, exact WeNet `forward_chunk` parity — issue #9). Measured with `RAYON_NUM_THREADS=8`: per-stage RTF ≈ 0.06 (ASR) / 0.04 (VC) / 0.06 (vocoder), late = 0 sustained.
 
 ## Performance notes
 
@@ -180,7 +181,7 @@ candle's CPU matmuls run on a rayon pool that defaults to **all logical cores**;
 
 ## External components
 
-MeanVC 2 trains only the UTTE and the DiT decoder. The three frozen components are pretrained external models, abstracted as traits in [`src/encoders.rs`](src/encoders.rs) with pure-candle backends in [`src/backends/`](src/backends/):
+MeanVC 2 trains only the UTTE and the DiT decoder. The three frozen components are pretrained external models, abstracted as traits in [`crates/vc-core/src/encoders.rs`](../crates/vc-core/src/encoders.rs) with pure-candle backends in [`crates/meanvc/src/backends/`](../crates/meanvc/src/backends/):
 
 | Component | Trait | Backend | Used in the paper |
 |---|---|---|---|
@@ -219,8 +220,8 @@ Known deviations from the paper (details in the module docs):
 ## Development
 
 ```sh
-cargo test          # unit + integration tests (shapes, masks, streaming)
-cargo clippy --all-targets
+cargo test --workspace          # unit + integration tests (shapes, masks, streaming)
+cargo clippy --workspace --all-targets
 cargo run --release --example streaming_demo
 ```
 

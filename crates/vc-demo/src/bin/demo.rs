@@ -6,7 +6,7 @@
 //! a selectable **virtual microphone** (`meanvc_mic`) in other apps.
 //!
 //! ```sh
-//! cargo run --release --features demo --bin meanvc-demo -- \
+//! cargo run --release -p vc-demo --bin meanvc-demo -- \
 //!     --reference ckpt/test.wav --voice-print ckpt/voice_print_test.safetensors
 //! ```
 //!
@@ -318,7 +318,11 @@ fn read_wav_16k(path: &str) -> anyhow::Result<Vec<f32>> {
 /// WavLM-Large SV model at ckpt/wavlm_sv.onnx. There is deliberately no
 /// file fallback: a stale precomputed voice print of a different speaker
 /// silently overrides the reference timbre.
-fn load_voice_print(args: &Args, reference: &[f32], device: &Device) -> anyhow::Result<Tensor> {
+fn load_voice_print(
+    args: &Args,
+    #[cfg_attr(not(feature = "wavlm"), allow(unused_variables))] reference: &[f32],
+    device: &Device,
+) -> anyhow::Result<Tensor> {
     if let Some(path) = &args.voice_print {
         let vp = candle_core::safetensors::load(path, device)
             .map_err(|e| anyhow::anyhow!("cannot read --voice-print {path}: {e}"))?;
@@ -337,7 +341,7 @@ fn load_voice_print(args: &Args, reference: &[f32], device: &Device) -> anyhow::
     #[cfg(not(feature = "wavlm"))]
     anyhow::bail!(
         "no --voice-print given and the wavlm feature is off; pass a precomputed \
-         voice print or rebuild with --features demo,wavlm"
+         voice print or rebuild with --features wavlm"
     )
 }
 

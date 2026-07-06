@@ -1,0 +1,33 @@
+//! # vc-core
+//!
+//! Shared, engine-agnostic foundation of the babiniku.rs voice-conversion
+//! workspace. Every engine crate (e.g. `meanvc`, `xvc`) builds on:
+//!
+//! * [`encoders`] — integration traits for the frozen external models of a
+//!   recognition–synthesis VC pipeline (semantic encoder, speaker encoder,
+//!   vocoder) plus small helpers such as [`encoders::upsample_bnf`].
+//! * [`audio`] — the audio front-end ([`audio::MelSpectrogram`], log-mel
+//!   extraction via `rustfft`).
+//! * [`config::MelConfig`] — the mel front-end configuration.
+//! * [`Error`] / [`Result`] — the common error type.
+//!
+//! Everything model-specific lives in the engine crates.
+
+pub mod audio;
+pub mod config;
+pub mod encoders;
+
+pub use config::MelConfig;
+
+/// Common error type of the voice-conversion crates.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("invalid configuration: {0}")]
+    Config(String),
+    #[error("invalid input: {0}")]
+    Input(String),
+    #[error(transparent)]
+    Candle(#[from] candle_core::Error),
+}
+
+pub type Result<T> = std::result::Result<T, Error>;

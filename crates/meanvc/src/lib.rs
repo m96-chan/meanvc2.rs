@@ -22,29 +22,18 @@
 //!
 //! [arXiv:2606.09050]: https://arxiv.org/abs/2606.09050
 
-pub mod audio;
 pub mod backends;
 pub mod config;
-pub mod encoders;
 pub mod frc;
 pub mod meanflow;
 pub mod model;
 pub mod streaming;
 pub mod v1;
 
+// Shared foundation re-exported from `vc-core` so existing `meanvc2::…`
+// paths (audio front-end, encoder traits, error type) keep working.
+pub use vc_core::{audio, encoders, Error, Result};
+
 pub use config::{DecoderConfig, MeanVc2Config, MelConfig, UtteConfig};
 pub use model::MeanVc2;
 pub use streaming::StreamingConverter;
-
-/// Crate-level error type.
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("invalid configuration: {0}")]
-    Config(String),
-    #[error("invalid input: {0}")]
-    Input(String),
-    #[error(transparent)]
-    Candle(#[from] candle_core::Error),
-}
-
-pub type Result<T> = std::result::Result<T, Error>;

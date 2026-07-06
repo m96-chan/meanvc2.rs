@@ -1,0 +1,13 @@
+[package]
+name = "xvc"
+description = "X-VC engine (zero-shot streaming voice conversion in codec space) — scaffold, see issue #30"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["voice-conversion", "speech", "streaming", "codec", "candle"]
+categories = ["multimedia::audio", "science"]
+
+[dependencies]
+vc-core = { workspace = true }

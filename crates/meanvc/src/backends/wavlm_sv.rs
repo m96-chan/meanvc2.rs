@@ -89,8 +89,9 @@ mod tests {
     use super::*;
 
     fn ckpt(name: &str) -> Option<std::path::PathBuf> {
+        // `ckpt/` lives at the workspace root, two levels above this crate.
         let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("ckpt")
+            .join("../../ckpt")
             .join(name);
         if !p.exists() {
             eprintln!("skipping: {name} not found (see tools/export_wavlm_onnx.py)");

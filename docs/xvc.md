@@ -103,7 +103,7 @@ and decide go/no-go on a Rust port. Nothing in this repo implements X-VC yet.
 If Phase 0 passes, X-VC follows the house pattern (see
 [docs/meanvc.md](meanvc.md)): a weight-compatible pure-candle port whose module
 tree mirrors the upstream implementation, frozen externals behind the
-`src/encoders.rs`-style traits (SAC codec, GLM-4-Voice tokenizer, ERes2Net),
+`vc-core` (`crates/vc-core/src/encoders.rs`)-style traits (SAC codec, GLM-4-Voice tokenizer, ERes2Net),
 safetensors conversion of the official checkpoints, and stage-by-stage golden
 tests against the official implementation before it is wired into the
 streaming demo. The 539 M-parameter footprint makes CPU viability the gating

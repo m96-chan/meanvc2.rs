@@ -1,48 +1,33 @@
-[package]
-name = "meanvc2"
+[workspace]
+resolver = "2"
+members = [
+    "crates/vc-core",
+    "crates/meanvc",
+    "crates/vc-demo",
+    "crates/xvc",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.80"
-description = "Unofficial Rust implementation of MeanVC 2: robust low-latency streaming zero-shot voice conversion"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/m96-chan/babiniku.rs"
-readme = "README.md"
-keywords = ["voice-conversion", "speech", "streaming", "diffusion", "candle"]
-categories = ["multimedia::audio", "science"]
 
-[dependencies]
+[workspace.dependencies]
+# Intra-workspace crates.
+vc-core = { path = "crates/vc-core" }
+meanvc = { path = "crates/meanvc" }
+# ML runtime: the m96-chan candle fork (forward-mode AD / JVP needed by the
+# mean-flows objective). Keep both crates on the same branch.
 candle-core = { git = "https://github.com/m96-chan/candle", branch = "feat/forward-ad-jvp" }
 candle-nn = { git = "https://github.com/m96-chan/candle", branch = "feat/forward-ad-jvp" }
 rustfft = "6"
 thiserror = "2"
-# TUI demo (feature "demo")
-anyhow = { version = "1", optional = true }
-num_cpus = { version = "1", optional = true }
-ort = { version = "2.0.0-rc.10", optional = true }
-signalsmith-stretch = { version = "0.1", optional = true }
-nnnoiseless = { version = "0.5", optional = true, default-features = false }
-ratatui = { version = "0.29", optional = true }
-crossterm = { version = "0.28", optional = true }
-libpulse-binding = { version = "2", optional = true }
-libpulse-simple-binding = { version = "2", optional = true }
-hound = { version = "3", optional = true }
-
-[dev-dependencies]
 anyhow = "1"
 hound = "3"
 num_cpus = "1"
-
-[features]
-default = []
-demo = ["dep:anyhow", "dep:num_cpus", "dep:ratatui", "dep:crossterm", "dep:libpulse-binding", "dep:libpulse-simple-binding", "dep:hound", "dep:signalsmith-stretch", "dep:nnnoiseless"]
-wavlm = ["dep:ort"]
-cuda = ["candle-core/cuda", "candle-nn/cuda"]
-metal = ["candle-core/metal", "candle-nn/metal"]
+ort = "2.0.0-rc.10"
 
 [profile.release]
 lto = "thin"
-
-[[bin]]
-name = "meanvc-demo"
-path = "src/bin/demo.rs"
-required-features = ["demo"]
