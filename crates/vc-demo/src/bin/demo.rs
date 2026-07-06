@@ -1228,6 +1228,13 @@ fn main() -> anyhow::Result<()> {
             } else {
                 chunk
             };
+            // Output headroom: the converted voice is extremely spiky
+            // (crest ≈ 19, glottal peaks at ~0.997) and worked the
+            // limiter on every loud syllable — audible as カタカタ gain
+            // rattling. −1.4 dB parks the peaks below the 0.90 threshold
+            // so the limiter is a rare safety, not a steady-state stage.
+            const HEADROOM: f32 = 0.85;
+            let chunk: Vec<f32> = chunk.iter().map(|s| s * HEADROOM).collect();
             // Bandwidth extension (issue #42): 16 → 48 kHz windowed-sinc
             // upsampling, then the harmonic exciter fills 8–16 kHz when
             // the wet knob is open (0 % = bit-exact bypass).

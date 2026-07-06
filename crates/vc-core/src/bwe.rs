@@ -428,7 +428,7 @@ pub struct Limiter {
 
 impl Limiter {
     pub fn new(sample_rate: f32, threshold: f32) -> Self {
-        let lookahead = (sample_rate * 0.0025) as usize; // 2.5 ms
+        let lookahead = (sample_rate * 0.005) as usize; // 5 ms
         Self {
             threshold,
             delay: std::collections::VecDeque::from(vec![0.0; lookahead]),
@@ -436,10 +436,14 @@ impl Limiter {
             window: std::collections::VecDeque::new(),
             pos: 0,
             gain: 1.0,
-            // ~0.4 ms attack: >=6 time constants inside the 2.5 ms
-            // look-ahead, so the gain is settled before the peak plays.
-            attack: 1.0 - (-1.0 / (0.0004 * sample_rate)).exp(),
-            release: 1.0 - (-1.0 / (0.080 * sample_rate)).exp(),
+            // ~1.5 ms attack: ≥3 time constants inside the 5 ms
+            // look-ahead (settled ≥96 % before the peak plays), slow
+            // enough that per-glottal-pulse gain moves are inaudible —
+            // the 0.4 ms attack read as カタカタ rattling when the
+            // converted voice (crest ≈ 19) worked the threshold on
+            // every loud syllable (eleventh field report).
+            attack: 1.0 - (-1.0 / (0.0015 * sample_rate)).exp(),
+            release: 1.0 - (-1.0 / (0.150 * sample_rate)).exp(),
         }
     }
 
@@ -481,7 +485,16 @@ impl Limiter {
             self.gain += coeff * (target - self.gain);
             self.delay.push_back(x);
             let out = self.delay.pop_front().unwrap_or(0.0);
-            *s = out * self.gain;
+            // Brickwall clamp: the smoothed gain settles ≥96 % inside the
+            // look-ahead; the remaining sliver is clamped exactly at the
+            // peak samples (a ≤2 % dip on isolated samples — inaudible,
+            // and the output can never exceed the threshold).
+            let need_now = if out.abs() * self.gain > self.threshold {
+                self.threshold / out.abs()
+            } else {
+                self.gain
+            };
+            *s = out * self.gain.min(need_now);
             self.pos += 1;
         }
     }
