@@ -110,7 +110,7 @@ this repo implements Zero-VC yet.
 If unblocked, Zero-VC follows the house pattern (see
 [docs/meanvc.md](meanvc.md)): pure-candle port with an upstream-mirroring
 module tree, frozen externals (WavLM-large, content encoder) behind the
-`src/encoders.rs`-style traits, and golden tests against the reference
+`vc-core` (`crates/vc-core/src/encoders.rs`)-style traits, and golden tests against the reference
 implementation. Its strictly causal, cache-based streaming maps cleanly onto
 the existing chunk-driver design, and the CPU RTF suggests it fits the
 driver-only-GPU rule; both claims are TBD (Phase 0) until we can run it.

@@ -1,0 +1,33 @@
+[package]
+name = "vc-demo"
+description = "Real-time TUI voice-conversion demo with a PulseAudio/PipeWire virtual microphone"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "meanvc-demo"
+path = "src/bin/demo.rs"
+
+[dependencies]
+meanvc = { workspace = true }
+candle-core = { workspace = true }
+anyhow = { workspace = true }
+num_cpus = { workspace = true }
+hound = { workspace = true }
+ratatui = "0.29"
+crossterm = "0.28"
+libpulse-binding = "2"
+libpulse-simple-binding = "2"
+signalsmith-stretch = "0.1"
+nnnoiseless = { version = "0.5", default-features = false }
+
+[features]
+default = []
+# Compute the voice print natively from the reference audio (WavLM ONNX).
+wavlm = ["meanvc/wavlm"]
+cuda = ["meanvc/cuda", "candle-core/cuda"]
+metal = ["meanvc/metal", "candle-core/metal"]

@@ -23,7 +23,8 @@ fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
 
 #[test]
 fn forward_chunk_matches_official_torchscript() {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("ckpt");
+    // `ckpt/` lives at the workspace root, two levels above this crate.
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ckpt");
     let fx_path = dir.join("asr_stream_fixture.safetensors");
     let weights = dir.join("fastu2pp.safetensors");
     if !fx_path.exists() || !weights.exists() {

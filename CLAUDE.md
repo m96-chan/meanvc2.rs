@@ -23,8 +23,8 @@ Low-Latency Streaming Zero-Shot Voice Conversion**
 - **Scope:** the trainable core of the paper — UTTE, the FRC-scheduled DiT
   decoder, the mean-flows objective/sampler, and the streaming chunk driver.
   The frozen external models (Fast-U2++ BNF extractor, ECAPA-TDNN speaker
-  encoder, Vocos vocoder) are abstracted as traits in `src/encoders.rs`;
-  concrete backends are tracked in issue #4.
+  encoder, Vocos vocoder) are abstracted as traits in
+  `crates/vc-core/src/encoders.rs`; concrete backends are tracked in issue #4.
 - **Fidelity to the paper is the priority:** where the paper is silent we
   follow common DiT/flow-matching practice, but every known deviation must be
   documented (module docs + README "Project status") and tracked as an issue.

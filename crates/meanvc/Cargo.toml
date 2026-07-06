@@ -1,0 +1,34 @@
+[package]
+name = "meanvc"
+description = "Unofficial Rust implementation of MeanVC 1 & 2: robust low-latency streaming zero-shot voice conversion"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["voice-conversion", "speech", "streaming", "diffusion", "candle"]
+categories = ["multimedia::audio", "science"]
+
+[lib]
+# Historical library name (the repo was born as meanvc2.rs); kept so that
+# `use meanvc2::…` in examples, tests, and downstream code stays valid.
+name = "meanvc2"
+
+[dependencies]
+vc-core = { workspace = true }
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+rustfft = { workspace = true }
+# WavLM speaker-verification backend via ONNX Runtime (feature "wavlm")
+ort = { workspace = true, optional = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+hound = { workspace = true }
+num_cpus = { workspace = true }
+
+[features]
+default = []
+wavlm = ["dep:ort"]
+cuda = ["vc-core/cuda", "candle-core/cuda", "candle-nn/cuda"]
+metal = ["vc-core/metal", "candle-core/metal", "candle-nn/metal"]

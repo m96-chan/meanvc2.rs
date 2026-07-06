@@ -15,10 +15,16 @@ use std::path::PathBuf;
 
 use candle_core::{forward_ad::jvp, Device, Tensor, Var, D};
 
+/// Path of `rel` at the workspace root (this crate lives two levels below
+/// it, in `crates/meanvc`); `ckpt/` and `tools/` are kept at the root.
+fn workspace_path(rel: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(rel)
+}
+
 fn fixture(name: &str) -> Option<HashMap<String, Tensor>> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tools/fixtures")
-        .join(name);
+    let path = workspace_path("tools/fixtures").join(name);
     if !path.exists() {
         eprintln!("skipping: fixture {name} not found — generate it with tools/gen_*_fixture.py");
         return None;
@@ -29,9 +35,7 @@ fn fixture(name: &str) -> Option<HashMap<String, Tensor>> {
 /// Path to a file under `ckpt/` (official checkpoints + v1 parity
 /// fixtures); `None` (skip) when it has not been downloaded/generated.
 fn ckpt_path(name: &str) -> Option<PathBuf> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("ckpt")
-        .join(name);
+    let path = workspace_path("ckpt").join(name);
     if !path.exists() {
         eprintln!(
             "skipping: ckpt/{name} not found — download the official checkpoints and run \

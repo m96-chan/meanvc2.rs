@@ -16,7 +16,7 @@
 babiniku.rs is the missing last mile: a **real-time zero-shot voice changer toolkit in pure Rust**. Give it a few seconds of your character's voice, speak, and a **virtual microphone** delivers her voice to Discord, Zoom, OBS — anything with a mic picker. On a plain CPU. No Python, no CUDA Toolkit, no cloud: your voice never leaves your machine.
 
 ```sh
-cargo run --release --features demo,wavlm --bin meanvc-demo -- \
+cargo run --release -p vc-demo --features wavlm --bin meanvc-demo -- \
     --reference her_voice.wav --monitor --denoise
 ```
 
@@ -38,7 +38,20 @@ Live TUI knobs while you speak: pitch (`[` `]`), noise suppression (`,` `.`), in
 | [X-VC](docs/xvc.md) | 🔍 evaluation | codec-space, multilingual — candidate for language-agnostic conversion ([#30](https://github.com/m96-chan/babiniku.rs/issues/30)) |
 | [Zero-VC](docs/zero-vc.md) | 🔍 evaluation | zero-lookahead (20 ms algorithmic latency) — latency-first candidate; no public code yet ([#31](https://github.com/m96-chan/babiniku.rs/issues/31)) |
 
-Every engine is ported weight-compatible and verified stage-by-stage against its official implementation with golden tests (`cargo test`). Deep dive, APIs, checkpoint setup, performance notes: [docs/meanvc.md](docs/meanvc.md). Issues are labeled by architecture (`meanvc`, `meanvc2`, `demo`, `infra`).
+Every engine is ported weight-compatible and verified stage-by-stage against its official implementation with golden tests (`cargo test --workspace`). Deep dive, APIs, checkpoint setup, performance notes: [docs/meanvc.md](docs/meanvc.md). Issues are labeled by architecture (`meanvc`, `meanvc2`, `demo`, `infra`).
+
+## Workspace layout
+
+The repo is a cargo workspace — one crate per engine on a shared foundation:
+
+| Crate | What it is |
+|---|---|
+| [`crates/vc-core`](crates/vc-core) | Engine-agnostic foundation: encoder/speaker/vocoder traits, log-mel front-end, `Error`/`Result` |
+| [`crates/meanvc`](crates/meanvc) | MeanVC v1 + MeanVC 2 engines (library name `meanvc2`), examples, golden tests |
+| [`crates/vc-demo`](crates/vc-demo) | The `meanvc-demo` real-time TUI / virtual-mic binary |
+| [`crates/xvc`](crates/xvc) | X-VC engine scaffold ([#30](https://github.com/m96-chan/babiniku.rs/issues/30)) |
+
+Checkpoints stay at the repo root (`ckpt/`), as do `tools/` and `docs/`.
 
 ## License
 
