@@ -143,6 +143,8 @@ struct Args {
     monitor: bool,
     denoise: bool,
     duration: Option<f32>,
+    /// Force CPU inference even when built with `--features cuda`.
+    cpu: bool,
 }
 
 fn parse_args() -> Args {
@@ -161,6 +163,7 @@ fn parse_args() -> Args {
         monitor: false,
         denoise: false,
         duration: None,
+        cpu: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(f) = it.next() {
@@ -182,6 +185,7 @@ fn parse_args() -> Args {
             "--wav" => a.wav = Some(it.next().expect("--wav <file>")),
             "--out" => a.out = Some(it.next().expect("--out <file>")),
             "--headless" => a.headless = true,
+            "--cpu" => a.cpu = true,
             "--no-sink" => a.no_sink = true,
             "--monitor" => a.monitor = true,
             "--denoise" => a.denoise = true,
@@ -459,6 +463,32 @@ fn load_voice_print(
     )
 }
 
+/// Device for the X-VC engine: CPU is the project baseline (never
+/// requires a GPU); a build with `--features cuda` places the whole
+/// engine on `cuda:0` when one is present (`--cpu` opts out). The
+/// meanvc engine stays on CPU — it is already real time there.
+#[cfg(feature = "cuda")]
+fn xvc_device(force_cpu: bool) -> Device {
+    if force_cpu {
+        return Device::Cpu;
+    }
+    match Device::new_cuda(0) {
+        Ok(d) => {
+            eprintln!("xvc engine on cuda:0");
+            d
+        }
+        Err(e) => {
+            eprintln!("CUDA unavailable ({e}); falling back to CPU");
+            Device::Cpu
+        }
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+fn xvc_device(_force_cpu: bool) -> Device {
+    Device::Cpu
+}
+
 fn pulse_spec() -> Spec {
     Spec {
         format: Format::FLOAT32NE,
@@ -675,7 +705,8 @@ fn main() -> anyhow::Result<()> {
             )
         }
         EngineKind::Xvc => {
-            let xeng = xvc::XvcEngine::load("ckpt", &device)
+            let xdev = xvc_device(args.cpu);
+            let xeng = xvc::XvcEngine::load("ckpt", &xdev)
                 .map_err(|e| anyhow::anyhow!("cannot load the X-VC engine: {e}"))?;
             let raw: Vec<f64> = read_wav_16k(&args.reference)?
                 .iter()
