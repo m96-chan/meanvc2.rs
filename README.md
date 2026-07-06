@@ -5,7 +5,7 @@
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
 [![License: MIT/Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-**babiniku.rs** turns your voice into any target speaker's voice from a few seconds of reference audio, in real time on a CPU, and exposes the result as a **virtual microphone** that Discord / Zoom / OBS can use directly. Built on [candle](https://github.com/huggingface/candle); no Python at runtime.
+**babiniku.rs** turns your voice into any target speaker's voice from a few seconds of reference audio, in real time on a CPU, and exposes the result as a **virtual microphone** that Discord / Zoom / OBS can use directly. Built on [candle](https://github.com/huggingface/candle); **no Python and no CUDA Toolkit required** — everything runs in real time on a plain CPU (GPU backends exist as opt-in cargo features but are never a setup requirement).
 
 ```sh
 cargo run --release --features demo,wavlm --bin meanvc-demo -- \

@@ -13,6 +13,10 @@ Low-Latency Streaming Zero-Shot Voice Conversion**
 ([arXiv:2606.09050](https://arxiv.org/abs/2606.09050)).
 
 - **Language / stack:** pure Rust.
+- **GPU: driver-only — do NOT introduce a dependency on the full CUDA
+  Toolkit.** CPU real-time is the baseline and a core feature; GPU stays an
+  opt-in cargo feature (`cuda`/`metal`) that must never be required for
+  build, tests, or the demo. Keep setup low-friction.
 - **ML runtime:** the [`m96-chan/candle`](https://github.com/m96-chan/candle)
   fork of candle, as a **git dependency** in `Cargo.toml` (not a submodule) —
   kept in sync with upstream; patch only when we hit a bug or a slow path.
