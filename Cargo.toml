@@ -18,6 +18,7 @@ repository = "https://github.com/m96-chan/babiniku.rs"
 # Intra-workspace crates.
 vc-core = { path = "crates/vc-core" }
 meanvc = { path = "crates/meanvc" }
+xvc = { path = "crates/xvc" }
 # ML runtime: the m96-chan candle fork (forward-mode AD / JVP needed by the
 # mean-flows objective). Keep both crates on the same branch.
 candle-core = { git = "https://github.com/m96-chan/candle", branch = "feat/forward-ad-jvp" }

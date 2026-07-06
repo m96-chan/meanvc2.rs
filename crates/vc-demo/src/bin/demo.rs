@@ -1,13 +1,17 @@
-//! MeanVC real-time TUI demo with a virtual microphone.
+//! Real-time voice-conversion TUI demo with a virtual microphone.
 //!
-//! Captures the default microphone, converts the voice with the official
-//! MeanVC v1 checkpoints chunk by chunk (200 ms), and plays the result
-//! into a PulseAudio/PipeWire null sink whose remapped monitor shows up as
-//! a selectable **virtual microphone** (`meanvc_mic`) in other apps.
+//! Captures the default microphone, converts the voice chunk by chunk
+//! with the selected engine (`--engine meanvc` (default, 200 ms chunks) or
+//! `--engine xvc` (240 ms hop, 640 ms re-encoded window — the official
+//! X-VC CPU streaming preset)), and plays the result into a
+//! PulseAudio/PipeWire null sink whose remapped monitor shows up as a
+//! selectable **virtual microphone** (`babiniku_mic`) in other apps.
 //!
 //! ```sh
-//! cargo run --release -p vc-demo --bin meanvc-demo -- \
+//! cargo run --release -p vc-demo --bin babiniku-demo -- \
 //!     --reference ckpt/test.wav --voice-print ckpt/voice_print_test.safetensors
+//! cargo run --release -p vc-demo --bin babiniku-demo -- \
+//!     --engine xvc --reference her_voice.wav
 //! ```
 //!
 //! Keys: `q` quit · `p` passthrough (bypass conversion for A/B) ·
@@ -47,9 +51,13 @@ use meanvc2::v1::{interpolate_linear, KaldiFbank, KvCache, MeanVc1, MeanVc1Confi
 use nnnoiseless::DenoiseState;
 use signalsmith_stretch::Stretch;
 use std::sync::atomic::AtomicI32;
+use xvc::preprocess::HighpassBiquad;
 
 const SR: usize = 16_000;
 const CHUNK_SAMPLES: usize = 3_200; // 200 ms = one CARD chunk (20 mel frames)
+/// X-VC hop: 240 ms of new audio per re-encoded 640 ms window (the CPU
+/// streaming preset 640/240/100/20 from issue #30).
+const XVC_CHUNK_SAMPLES: usize = 3_840;
 const FBANK_WINDOW: usize = 400; // kaldi 25 ms frame
 const FBANK_SHIFT: usize = 160; // kaldi 10 ms shift
 const BNF_CHUNK: usize = 5; // subsampled BNF frames per CARD chunk
@@ -59,8 +67,8 @@ const MEL_TAIL: usize = 32; // vocoder left context, in mel frames (320 ms)
 /// end of the previous chunk; holding back FADE samples and cross-fading
 /// removes the phase discontinuity at the join.
 const FADE: usize = 160;
-const SINK: &str = "meanvc";
-const VIRT_MIC: &str = "meanvc_mic";
+const SINK: &str = "babiniku";
+const VIRT_MIC: &str = "babiniku_mic";
 
 /// Live-tunable knobs shared with the TUI thread.
 struct Controls {
@@ -72,6 +80,38 @@ struct Controls {
     /// voiced murmurs on silent input, so sub-threshold chunks bypass the
     /// DiT and emit silence. i32::MIN disables.
     gate_db: AtomicI32,
+}
+
+/// Which engine converts the voice.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EngineKind {
+    MeanVc,
+    Xvc,
+}
+
+impl EngineKind {
+    fn name(self) -> &'static str {
+        match self {
+            EngineKind::MeanVc => "meanvc",
+            EngineKind::Xvc => "xvc",
+        }
+    }
+
+    /// Input chunk per hop, in samples.
+    fn chunk_samples(self) -> usize {
+        match self {
+            EngineKind::MeanVc => CHUNK_SAMPLES,
+            EngineKind::Xvc => XVC_CHUNK_SAMPLES,
+        }
+    }
+
+    /// Labels of the three per-stage RTF slots.
+    fn stage_names(self) -> [&'static str; 3] {
+        match self {
+            EngineKind::MeanVc => ["asr", "vc", "vocoder"],
+            EngineKind::Xvc => ["semantic", "convert", "decode"],
+        }
+    }
 }
 
 #[derive(Default)]
@@ -89,6 +129,7 @@ struct Stats {
 }
 
 struct Args {
+    engine: EngineKind,
     reference: String,
     voice_print: Option<String>,
     wav: Option<String>,
@@ -106,6 +147,7 @@ struct Args {
 
 fn parse_args() -> Args {
     let mut a = Args {
+        engine: EngineKind::MeanVc,
         reference: "ckpt/test.wav".into(),
         voice_print: None,
         wav: None,
@@ -123,8 +165,20 @@ fn parse_args() -> Args {
     let mut it = std::env::args().skip(1);
     while let Some(f) = it.next() {
         match f.as_str() {
+            "--engine" => {
+                a.engine = match it.next().as_deref() {
+                    Some("meanvc") => EngineKind::MeanVc,
+                    Some("xvc") => EngineKind::Xvc,
+                    other => {
+                        eprintln!("--engine must be meanvc or xvc (got {other:?})");
+                        std::process::exit(2);
+                    }
+                }
+            }
             "--reference" => a.reference = it.next().expect("--reference <wav>"),
-            "--voice-print" => a.voice_print = Some(it.next().expect("--voice-print <safetensors>")),
+            "--voice-print" => {
+                a.voice_print = Some(it.next().expect("--voice-print <safetensors>"))
+            }
             "--wav" => a.wav = Some(it.next().expect("--wav <file>")),
             "--out" => a.out = Some(it.next().expect("--out <file>")),
             "--headless" => a.headless = true,
@@ -132,13 +186,22 @@ fn parse_args() -> Args {
             "--monitor" => a.monitor = true,
             "--denoise" => a.denoise = true,
             "--pitch-shift" => {
-                a.pitch_shift = it.next().and_then(|v| v.parse().ok()).expect("--pitch-shift <semitones>")
+                a.pitch_shift = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .expect("--pitch-shift <semitones>")
             }
             "--denoise-mix" => {
-                a.denoise_mix = it.next().and_then(|v| v.parse().ok()).expect("--denoise-mix <0-100>")
+                a.denoise_mix = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .expect("--denoise-mix <0-100>")
             }
             "--gate" => {
-                a.gate_db = it.next().and_then(|v| v.parse().ok()).expect("--gate <dBFS, e.g. -45>")
+                a.gate_db = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .expect("--gate <dBFS, e.g. -45>")
             }
             "--input-device" => a.input_device = Some(it.next().expect("--input-device <source>")),
             "--duration" => a.duration = it.next().and_then(|s| s.parse().ok()),
@@ -168,18 +231,18 @@ fn create_virtual_device() -> anyhow::Result<Vec<String>> {
     let sink = load(&[
         "module-null-sink",
         &format!("sink_name={SINK}"),
-        "sink_properties=device.description=MeanVC-Output",
+        "sink_properties=device.description=Babiniku-Output",
     ])?;
     let mic = load(&[
         "module-remap-source",
         &format!("source_name={VIRT_MIC}"),
         &format!("master={SINK}.monitor"),
-        "source_properties=device.description=MeanVC-Virtual-Mic",
+        "source_properties=device.description=Babiniku-Virtual-Mic",
     ])?;
     Ok(vec![sink, mic])
 }
 
-const DENOISED_SRC: &str = "meanvc_denoised";
+const DENOISED_SRC: &str = "babiniku_denoised";
 
 /// In-process RNNoise at 16 kHz: exact x3 up/down resampling around the
 /// 48 kHz, 480-sample RNNoise frames (3200 in -> 20 frames -> 3200 out).
@@ -209,7 +272,10 @@ impl Rnnoise16k {
         }
         self.prev = last;
         let mut den = vec![0f32; up.len()];
-        for (i_chunk, o_chunk) in up.chunks(DenoiseState::FRAME_SIZE).zip(den.chunks_mut(DenoiseState::FRAME_SIZE)) {
+        for (i_chunk, o_chunk) in up
+            .chunks(DenoiseState::FRAME_SIZE)
+            .zip(den.chunks_mut(DenoiseState::FRAME_SIZE))
+        {
             self.state.process_frame(o_chunk, i_chunk);
         }
         // 3-tap mean + decimate (48k -> 16k).
@@ -235,7 +301,7 @@ fn create_denoiser(master: Option<&str>) -> anyhow::Result<String> {
         "module-echo-cancel",
         &format!("source_name={DENOISED_SRC}"),
         "aec_method=webrtc",
-        "source_properties=device.description=MeanVC-Denoised-Input",
+        "source_properties=device.description=Babiniku-Denoised-Input",
     ]);
     if let Some(m) = master {
         cmd.arg(format!("source_master={m}"));
@@ -313,6 +379,54 @@ fn read_wav_16k(path: &str) -> anyhow::Result<Vec<f32>> {
     Ok(s.into_iter().step_by(spec.channels as usize).collect())
 }
 
+/// Streaming approximation of X-VC's utterance-level percentile volume
+/// normalization (`utils/audio.py::audio_volume_normalize`, coeff 0.2)
+/// for live microphone input: the 90th–99th-percentile statistic runs
+/// over a sliding window of the last few seconds and the gain is
+/// smoothed between chunks. Wav input bypasses this and uses the exact
+/// offline preprocessing instead.
+struct MicVolumeNormalizer {
+    hist: std::collections::VecDeque<f32>,
+    gain: f64,
+}
+
+impl MicVolumeNormalizer {
+    const WINDOW: usize = 8 * SR; // percentile statistic over 8 s
+    const COEFF: f64 = 0.2;
+
+    fn new() -> Self {
+        Self {
+            hist: std::collections::VecDeque::with_capacity(Self::WINDOW),
+            gain: 1.0,
+        }
+    }
+
+    /// Updates the gain estimate with one chunk and applies it in place.
+    fn process(&mut self, chunk: &mut [f64]) {
+        for &s in chunk.iter() {
+            if self.hist.len() == Self::WINDOW {
+                self.hist.pop_front();
+            }
+            self.hist.push_back(s.abs() as f32);
+        }
+        let mut significant: Vec<f32> = self.hist.iter().copied().filter(|&s| s > 0.01).collect();
+        if significant.len() > 10 {
+            significant.sort_by(|a, b| a.total_cmp(b));
+            let (lo, hi) = (
+                (0.9 * significant.len() as f64) as usize,
+                (0.99 * significant.len() as f64) as usize,
+            );
+            let volume =
+                significant[lo..hi].iter().map(|&s| s as f64).sum::<f64>() / (hi - lo) as f64;
+            let target = (Self::COEFF / volume).clamp(0.1, 10.0);
+            self.gain = 0.8 * self.gain + 0.2 * target;
+        }
+        for s in chunk {
+            *s = (*s * self.gain).clamp(-1.0, 1.0);
+        }
+    }
+}
+
 /// Voice print: an explicitly passed safetensors file, otherwise (feature
 /// "wavlm") computed natively FROM THE REFERENCE AUDIO via the ONNX
 /// WavLM-Large SV model at ckpt/wavlm_sv.onnx. There is deliberately no
@@ -353,6 +467,130 @@ fn pulse_spec() -> Spec {
     }
 }
 
+/// Message to the output thread: a mel chunk to vocode (MeanVC) or
+/// ready waveform samples (X-VC, passthrough, gate silence).
+enum OutMsg {
+    Mel(Tensor),
+    Raw(Vec<f32>),
+}
+
+/// Per-engine model state, moved into the conversion thread.
+enum Models {
+    MeanVc {
+        model: Box<MeanVc1>,
+        asr: Box<FastU2pp>,
+        prompt_mel: Tensor,
+        spks: Tensor,
+    },
+    Xvc {
+        engine: Box<xvc::XvcEngine>,
+        reference: xvc::Reference,
+    },
+}
+
+/// The X-VC conversion loop: 240 ms input hops feed the 640/240/100/20
+/// stateless-window streaming driver; each ready window emits 240 ms of
+/// converted waveform (the engine decodes to waveform itself, so there is
+/// no separate vocoder stage). Microphone input is preprocessed
+/// incrementally (sliding-percentile volume normalization + streaming
+/// 40 Hz high-pass); wav input arrives already preprocessed offline.
+#[allow(clippy::too_many_arguments)]
+fn run_xvc_conversion(
+    engine: &xvc::XvcEngine,
+    reference: xvc::Reference,
+    mic_input: bool,
+    rx_in: std::sync::mpsc::Receiver<Vec<f32>>,
+    tx_out: std::sync::mpsc::SyncSender<OutMsg>,
+    stats: Arc<Mutex<Stats>>,
+    run: Arc<AtomicBool>,
+    controls: Arc<Controls>,
+) -> anyhow::Result<()> {
+    let cfg = xvc::StreamConfig::default();
+    let hop = cfg.current_ms as f32 / 1000.0;
+    let mut stream = engine.stream(reference.clone(), cfg)?;
+    let mut hp = HighpassBiquad::new(SR as f64, 40.0);
+    let mut norm = MicVolumeNormalizer::new();
+    let mut was_passthrough = false;
+    // Gate hangover: keep converting this many chunks after the level
+    // drops, so word tails are not clipped.
+    const HANGOVER: u32 = 2;
+    let mut open_for = 0u32;
+    while run.load(Ordering::Relaxed) {
+        let Ok(chunk) = rx_in.recv_timeout(Duration::from_millis(300)) else {
+            continue;
+        };
+        let passthrough = stats.lock().unwrap().passthrough;
+        let in_level = rms(&chunk);
+        if passthrough {
+            was_passthrough = true;
+            let mut st = stats.lock().unwrap();
+            st.in_rms = in_level;
+            st.out_rms = in_level;
+            st.chunks += 1;
+            drop(st);
+            let _ = tx_out.send(OutMsg::Raw(chunk));
+            continue;
+        }
+        if was_passthrough {
+            // Restart the stream timeline: the window history must not
+            // carry context across the bypassed audio.
+            stream = engine.stream(reference.clone(), cfg)?;
+            hp = HighpassBiquad::new(SR as f64, 40.0);
+            was_passthrough = false;
+        }
+
+        // Input energy gate: silent windows skip the whole model forward
+        // (the converter hallucinates voiced murmurs on silence).
+        let gate = controls.gate_db.load(Ordering::Relaxed);
+        let db = 20.0 * in_level.max(1e-9).log10();
+        if db >= gate as f32 {
+            open_for = HANGOVER + 1;
+        }
+        open_for = open_for.saturating_sub(1);
+        let gated = open_for == 0;
+
+        let prepared: Vec<f32> = if gated {
+            vec![0.0; chunk.len()]
+        } else if mic_input {
+            let mut c64: Vec<f64> = chunk.iter().map(|&s| s as f64).collect();
+            norm.process(&mut c64);
+            hp.process(&mut c64);
+            c64.iter().map(|&s| s as f32).collect()
+        } else {
+            chunk
+        };
+        stream.push(&prepared);
+
+        // The pipeline is windowed, so the converted tail of earlier
+        // speech still drains while the gate is closed.
+        while let Some(step) = stream
+            .step()
+            .map_err(|e| anyhow::anyhow!("xvc step: {e}"))?
+        {
+            let t = step.timings;
+            {
+                let mut st = stats.lock().unwrap();
+                st.rtf_asr = t.semantic.as_secs_f32() / hop;
+                st.rtf_vc = t.acoustic.as_secs_f32() / hop;
+                st.rtf_voc = t.decode.as_secs_f32() / hop;
+                st.out_rms = rms(&step.samples);
+                if t.total() > Duration::from_secs_f32(hop) {
+                    st.late += 1;
+                }
+            }
+            let _ = tx_out.send(OutMsg::Raw(step.samples));
+        }
+
+        let mut st = stats.lock().unwrap();
+        st.in_rms = in_level;
+        st.chunks += 1;
+        if gated {
+            st.gated += 1;
+        }
+    }
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     // candle's CPU gemm uses a rayon pool that defaults to all logical
     // cores; on SMT machines the contention roughly triples small-chunk
@@ -363,26 +601,58 @@ fn main() -> anyhow::Result<()> {
     }
     let args = parse_args();
     let device = Device::Cpu;
+    let engine = args.engine;
+    let chunk_samples = engine.chunk_samples();
 
-    eprintln!("loading models…");
-    let model = MeanVc1::load(
-        MeanVc1Config::default(),
-        "ckpt/model_200ms.safetensors",
-        &device,
-    )?;
-    let asr = FastU2pp::load(
-        FastU2ppConfig::official_meanvc1(),
-        "ckpt/fastu2pp.safetensors",
-        &device,
-    )?;
-    let vocos = Vocos::load(
-        VocosConfig::official_meanvc1(),
-        "ckpt/vocos.safetensors",
-        &device,
-    )?;
-    let reference = read_wav_16k(&args.reference)?;
-    let prompt_mel = MelV1::new().compute(&reference, &device)?.unsqueeze(0)?;
-    let spks = load_voice_print(&args, &reference, &device)?.unsqueeze(0)?;
+    eprintln!("loading models ({} engine)…", engine.name());
+    let (models, vocos) = match engine {
+        EngineKind::MeanVc => {
+            let model = MeanVc1::load(
+                MeanVc1Config::default(),
+                "ckpt/model_200ms.safetensors",
+                &device,
+            )?;
+            let asr = FastU2pp::load(
+                FastU2ppConfig::official_meanvc1(),
+                "ckpt/fastu2pp.safetensors",
+                &device,
+            )?;
+            let vocos = Vocos::load(
+                VocosConfig::official_meanvc1(),
+                "ckpt/vocos.safetensors",
+                &device,
+            )?;
+            let reference = read_wav_16k(&args.reference)?;
+            let prompt_mel = MelV1::new().compute(&reference, &device)?.unsqueeze(0)?;
+            let spks = load_voice_print(&args, &reference, &device)?.unsqueeze(0)?;
+            (
+                Models::MeanVc {
+                    model: Box::new(model),
+                    asr: Box::new(asr),
+                    prompt_mel,
+                    spks,
+                },
+                Some(vocos),
+            )
+        }
+        EngineKind::Xvc => {
+            let xeng = xvc::XvcEngine::load("ckpt", &device)
+                .map_err(|e| anyhow::anyhow!("cannot load the X-VC engine: {e}"))?;
+            let raw: Vec<f64> = read_wav_16k(&args.reference)?
+                .iter()
+                .map(|&s| s as f64)
+                .collect();
+            let target = xeng.preprocess(&raw);
+            let reference = xeng.prepare_reference(&target)?;
+            (
+                Models::Xvc {
+                    engine: Box::new(xeng),
+                    reference,
+                },
+                None,
+            )
+        }
+    };
 
     let mut modules = if args.no_sink {
         Vec::new()
@@ -410,7 +680,7 @@ fn main() -> anyhow::Result<()> {
     let stats = Arc::new(Mutex::new(Stats {
         status: if sink_ok {
             format!(
-                "virtual mic \"{VIRT_MIC}\" is live — select \"MeanVC-Virtual-Mic\" in your app"
+                "virtual mic \"{VIRT_MIC}\" is live — select \"Babiniku-Virtual-Mic\" in your app"
             )
         } else {
             "virtual sink disabled (--no-sink)".into()
@@ -419,35 +689,54 @@ fn main() -> anyhow::Result<()> {
     }));
     let run = Arc::new(AtomicBool::new(true));
 
-    // --- input thread: microphone or paced wav file -> chunk channel
+    // --- input thread: microphone or paced wav file -> chunk channel.
+    // With --engine xvc the wav is preprocessed offline first (exact
+    // official volume normalization + high-pass); microphone input is
+    // preprocessed incrementally in the conversion thread instead.
+    let wav_samples: Option<Vec<f32>> = match &args.wav {
+        None => None,
+        Some(path) => Some(match engine {
+            EngineKind::MeanVc => read_wav_16k(path)?,
+            EngineKind::Xvc => {
+                let raw: Vec<f64> = read_wav_16k(path)?.iter().map(|&s| s as f64).collect();
+                xvc::preprocess::preprocess(&raw, &Default::default())
+            }
+        }),
+    };
+    let mic_input = wav_samples.is_none();
     let (tx_in, rx_in) = std::sync::mpsc::sync_channel::<Vec<f32>>(8);
     let run_in = run.clone();
-    let wav_src = args.wav.clone();
     let capture_device = capture_device.clone();
     let controls_in = controls.clone();
+    let hop_ms = chunk_samples as u64 * 1000 / SR as u64;
     let input = std::thread::spawn(move || -> anyhow::Result<()> {
         let mut rnnoise = Rnnoise16k::new();
         let mut denoise_chunk = |c: Vec<f32>| -> Vec<f32> {
-            let mix = controls_in.denoise_mix.load(Ordering::Relaxed).clamp(0, 100);
+            let mix = controls_in
+                .denoise_mix
+                .load(Ordering::Relaxed)
+                .clamp(0, 100);
             if mix == 0 {
                 return c;
             }
             let wet = rnnoise.process(&c);
             let w = mix as f32 / 100.0;
-            c.iter().zip(&wet).map(|(d, n)| d * (1.0 - w) + n * w).collect()
+            c.iter()
+                .zip(&wet)
+                .map(|(d, n)| d * (1.0 - w) + n * w)
+                .collect()
         };
-        match wav_src {
-            Some(path) => {
-                let samples = read_wav_16k(&path)?;
+        match wav_samples {
+            Some(samples) => {
                 let t0 = Instant::now();
-                for (i, chunk) in samples.chunks(CHUNK_SAMPLES).enumerate() {
+                for (i, chunk) in samples.chunks(chunk_samples).enumerate() {
                     if !run_in.load(Ordering::Relaxed) {
                         break;
                     }
                     let mut c = chunk.to_vec();
-                    c.resize(CHUNK_SAMPLES, 0.0);
+                    c.resize(chunk_samples, 0.0);
                     // Pace to real time.
-                    let due = Duration::from_millis(200 * i as u64);
+                    let due = Duration::from_millis(hop_ms * i as u64);
                     if let Some(wait) = due.checked_sub(t0.elapsed()) {
                         std::thread::sleep(wait);
                     }
@@ -460,7 +749,7 @@ fn main() -> anyhow::Result<()> {
             None => {
                 let s = Simple::new(
                     None,
-                    "meanvc-demo",
+                    "babiniku-demo",
                     Direction::Record,
                     capture_device.as_deref(),
                     "capture",
@@ -469,7 +758,7 @@ fn main() -> anyhow::Result<()> {
                     None,
                 )
                 .map_err(|e| anyhow::anyhow!("pulse record: {e}"))?;
-                let mut buf = vec![0u8; CHUNK_SAMPLES * 4];
+                let mut buf = vec![0u8; chunk_samples * 4];
                 while run_in.load(Ordering::Relaxed) {
                     s.read(&mut buf).map_err(|e| anyhow::anyhow!("read: {e}"))?;
                     let c: Vec<f32> = buf
@@ -487,10 +776,6 @@ fn main() -> anyhow::Result<()> {
 
     // --- output thread: vocoding + playback (pipelined with the VC stage
     // so the two heaviest stages run concurrently).
-    enum OutMsg {
-        Mel(Tensor),
-        Raw(Vec<f32>),
-    }
     let (tx_out, rx_out) = std::sync::mpsc::sync_channel::<OutMsg>(8);
     let run_out = run.clone();
     let out_path = args.out.clone();
@@ -503,7 +788,7 @@ fn main() -> anyhow::Result<()> {
             Some(
                 Simple::new(
                     None,
-                    "meanvc-demo",
+                    "babiniku-demo",
                     Direction::Playback,
                     Some(SINK),
                     "converted",
@@ -537,7 +822,9 @@ fn main() -> anyhow::Result<()> {
             let chunk: Vec<f32> = match msg {
                 OutMsg::Raw(c) => c,
                 OutMsg::Mel(mel) => {
-                    // Vocoding with a mel tail as left context.
+                    // Vocoding with a mel tail as left context (MeanVC
+                    // only; the X-VC engine decodes to waveform itself).
+                    let vocos = vocos.as_ref().expect("Mel chunks require the vocoder");
                     let t0 = Instant::now();
                     let mel_win = match &mel_tail {
                         Some(tail) => Tensor::cat(&[tail, &mel], 1)?,
@@ -605,6 +892,29 @@ fn main() -> anyhow::Result<()> {
     let run_vc = run.clone();
     let controls_vc = controls.clone();
     let vc = std::thread::spawn(move || -> anyhow::Result<()> {
+        let (model, asr, prompt_mel, spks) = match models {
+            Models::Xvc {
+                engine: xeng,
+                reference,
+            } => {
+                return run_xvc_conversion(
+                    &xeng,
+                    reference,
+                    mic_input,
+                    rx_in,
+                    tx_out,
+                    stats_vc,
+                    run_vc,
+                    controls_vc,
+                );
+            }
+            Models::MeanVc {
+                model,
+                asr,
+                prompt_mel,
+                spks,
+            } => (model, asr, prompt_mel, spks),
+        };
         let fbank = KaldiFbank::new();
         // Incremental front end: raw-sample carry for the fbank framing and
         // the Fast-U2++ streaming caches (att K/V + conv left context).
@@ -743,15 +1053,27 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             let st = stats.lock().unwrap();
+            let names = engine.stage_names();
             eprint!(
-                "\rchunks {:4}  in {:.3} out {:.3}  RTF asr {:.2} vc {:.2} voc {:.2}  late {}   ",
-                st.chunks, st.in_rms, st.out_rms, st.rtf_asr, st.rtf_vc, st.rtf_voc, st.late
+                "\r[{}] chunks {:4}  in {:.3} out {:.3}  RTF {} {:.2} {} {:.2} {} {:.2}  late {}   ",
+                engine.name(),
+                st.chunks,
+                st.in_rms,
+                st.out_rms,
+                names[0],
+                st.rtf_asr,
+                names[1],
+                st.rtf_vc,
+                names[2],
+                st.rtf_voc,
+                st.late
             );
             std::io::stderr().flush().ok();
         }
         eprintln!();
     } else {
         run_tui(
+            engine,
             stats.clone(),
             run.clone(),
             monitor.clone(),
@@ -774,6 +1096,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn run_tui(
+    engine: EngineKind,
     stats: Arc<Mutex<Stats>>,
     run: Arc<AtomicBool>,
     monitor: Arc<Monitor>,
@@ -860,11 +1183,15 @@ fn run_tui(
             let pitch = controls.pitch_decisemitones.load(Ordering::Relaxed) as f32 / 10.0;
             let mix = controls.denoise_mix.load(Ordering::Relaxed);
             let gate = controls.gate_db.load(Ordering::Relaxed);
+            let names = engine.stage_names();
             f.render_widget(
                 Paragraph::new(format!(
-                    "RTF  asr {:.2} · vc {:.2} · vocoder {:.2}\nchunks {} · late {} · gated {} · mode {}\npitch {:+.1} st ([ / ])  ·  denoise mix {}% (, / .)  ·  gate {} dB (- / =)",
+                    "RTF  {} {:.2} · {} {:.2} · {} {:.2}\nchunks {} · late {} · gated {} · mode {}\npitch {:+.1} st ([ / ])  ·  denoise mix {}% (, / .)  ·  gate {} dB (- / =)",
+                    names[0],
                     snapshot.2,
+                    names[1],
                     snapshot.3,
+                    names[2],
                     snapshot.4,
                     snapshot.5,
                     snapshot.6,
@@ -874,7 +1201,10 @@ fn run_tui(
                     mix,
                     gate,
                 ))
-                .block(Block::default().borders(Borders::ALL).title(" pipeline ")),
+                .block(Block::default().borders(Borders::ALL).title(format!(
+                    " pipeline — engine {} ",
+                    engine.name()
+                ))),
                 rows[3],
             );
             f.render_widget(
@@ -887,11 +1217,10 @@ fn run_tui(
                         "off"
                     }
                 ))
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(" MeanVC virtual mic "),
-                ),
+                .block(Block::default().borders(Borders::ALL).title(format!(
+                    " babiniku virtual mic — {} ",
+                    engine.name()
+                ))),
                 rows[4],
             );
         })?;
@@ -908,19 +1237,27 @@ fn run_tui(
                     }
                     KeyCode::Char('[') => {
                         let v = controls.pitch_decisemitones.load(Ordering::Relaxed);
-                        controls.pitch_decisemitones.store((v - 5).max(-120), Ordering::Relaxed);
+                        controls
+                            .pitch_decisemitones
+                            .store((v - 5).max(-120), Ordering::Relaxed);
                     }
                     KeyCode::Char(']') => {
                         let v = controls.pitch_decisemitones.load(Ordering::Relaxed);
-                        controls.pitch_decisemitones.store((v + 5).min(120), Ordering::Relaxed);
+                        controls
+                            .pitch_decisemitones
+                            .store((v + 5).min(120), Ordering::Relaxed);
                     }
                     KeyCode::Char(',') => {
                         let v = controls.denoise_mix.load(Ordering::Relaxed);
-                        controls.denoise_mix.store((v - 10).max(0), Ordering::Relaxed);
+                        controls
+                            .denoise_mix
+                            .store((v - 10).max(0), Ordering::Relaxed);
                     }
                     KeyCode::Char('.') => {
                         let v = controls.denoise_mix.load(Ordering::Relaxed);
-                        controls.denoise_mix.store((v + 10).min(100), Ordering::Relaxed);
+                        controls
+                            .denoise_mix
+                            .store((v + 10).min(100), Ordering::Relaxed);
                     }
                     KeyCode::Char('-') => {
                         let v = controls.gate_db.load(Ordering::Relaxed);

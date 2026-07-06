@@ -17,13 +17,18 @@
 //!   192-d utterance embedding)
 //! * [`codec`] — SAC acoustic codec (DAC-style encoder/decoder, FVQ)
 //! * [`converter`] — 6-block MMDiT acoustic converter (one-step)
+//! * [`pipeline`] — the end-to-end engine ([`XvcEngine`]): prenet fusion,
+//!   offline conversion and the official chunk-streaming driver
+//!   ([`XvcStream`])
 
 pub mod codec;
 pub mod converter;
+pub mod pipeline;
 pub mod preprocess;
 pub mod speaker;
 pub mod tokenizer;
 
 pub use codec::{SacCodec, SacCodecConfig, SacEncodeOutput};
 pub use converter::{AcousticConverter, AcousticConverterConfig};
+pub use pipeline::{Reference, StageTimings, StreamConfig, StreamStep, XvcEngine, XvcStream};
 pub use speaker::SpeakerEncoder;

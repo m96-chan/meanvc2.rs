@@ -160,10 +160,10 @@ See [`crates/vc-demo/src/bin/demo.rs`](../crates/vc-demo/src/bin/demo.rs) for th
 
 ## Real-time TUI demo with a virtual microphone (Linux)
 
-`meanvc-demo` converts your microphone in real time and exposes the result as a **virtual microphone** (`MeanVC-Virtual-Mic`, via a PipeWire/PulseAudio null sink) selectable from any app:
+`babiniku-demo` converts your microphone in real time and exposes the result as a **virtual microphone** (`Babiniku-Virtual-Mic`, via a PipeWire/PulseAudio null sink) selectable from any app:
 
 ```sh
-cargo run --release -p vc-demo --features wavlm --bin meanvc-demo -- \
+cargo run --release -p vc-demo --features wavlm --bin babiniku-demo -- \
     --reference target_voice.wav
 ```
 
@@ -175,7 +175,7 @@ TUI shows level meters, per-stage RTF, and supports `p` (passthrough A/B), `l` (
 
 candle's CPU matmuls run on a rayon pool that defaults to **all logical cores**; on SMT (hyper-threaded) machines the resulting contention makes the small per-chunk workloads ~3–10× slower. Set `RAYON_NUM_THREADS` to the number of **physical** cores for the best CPU latency — measured on an 8c/16t machine ([#19](https://github.com/m96-chan/meanvc2.rs/issues/19)): demo vocoder chunk RTF 0.57 → 0.06, offline `convert_v1` end-to-end 456 ms → 226 ms.
 
-- `meanvc-demo` and the `convert_v1` example pin the pool to physical cores automatically when `RAYON_NUM_THREADS` is unset.
+- `babiniku-demo` and the `convert_v1` example pin the pool to physical cores automatically when `RAYON_NUM_THREADS` is unset.
 - The other offline examples, and the library itself, use candle's default; set the variable yourself, e.g. `RAYON_NUM_THREADS=8 cargo run --release --example streaming_demo`.
 - When embedding the crate, set `RAYON_NUM_THREADS` (or configure the global rayon pool) before the first tensor op — the pool size is fixed at first use.
 
