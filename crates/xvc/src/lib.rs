@@ -30,5 +30,7 @@ pub mod tokenizer;
 
 pub use codec::{SacCodec, SacCodecConfig, SacEncodeOutput};
 pub use converter::{AcousticConverter, AcousticConverterConfig};
-pub use pipeline::{Reference, StageTimings, StreamConfig, StreamStep, XvcEngine, XvcStream};
+pub use pipeline::{
+    Reference, StageTimings, StreamConfig, StreamStep, XvcEngine, XvcPipelinedStream, XvcStream,
+};
 pub use speaker::SpeakerEncoder;

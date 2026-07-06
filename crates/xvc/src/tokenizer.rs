@@ -399,6 +399,51 @@ impl Default for SemanticAdapterConfig {
     }
 }
 
+/// Depthwise conv1d (stride/dilation 1) expressed as `k` shifted
+/// broadcast-mul-adds:
+/// `y[b, c, t] = bias[c] + Σᵢ w[c, 0, i] · x_pad[b, c, t + i]`.
+/// Mathematically identical to the grouped conv; on CUDA candle's grouped
+/// conv1d dispatches **one kernel per group** (= `dim` launches per call),
+/// which made the two ConvNeXt stacks (semantic adapter + prenet) dominate
+/// the whole GPU pipeline (issue #38: 90 + 167 ms of the ~275 ms window
+/// forward) — this formulation needs ~2·k launches.
+fn depthwise_conv1d_shifted(conv: &Conv1d, x: &Tensor) -> candle_core::Result<Tensor> {
+    let w = conv.weight(); // [dim, 1, k]
+    let (dim, _, k) = w.dims3()?;
+    let pad = conv.config().padding;
+    let xp = if pad > 0 {
+        x.pad_with_zeros(D::Minus1, pad, pad)?
+    } else {
+        x.clone()
+    };
+    let t_out = xp.dim(D::Minus1)? - (k - 1);
+    let mut acc: Option<Tensor> = None;
+    for i in 0..k {
+        let wi = w.narrow(D::Minus1, i, 1)?.reshape((1, dim, 1))?;
+        let term = xp.narrow(D::Minus1, i, t_out)?.broadcast_mul(&wi)?;
+        acc = Some(match acc {
+            Some(a) => (a + term)?,
+            None => term,
+        });
+    }
+    let y = acc.expect("kernel size > 0");
+    match conv.bias() {
+        Some(b) => y.broadcast_add(&b.reshape((1, dim, 1))?),
+        None => Ok(y),
+    }
+}
+
+/// Depthwise conv1d on the fast path for the device: the stock grouped
+/// conv1d on CPU (bit-exact with the golden fixtures), the shifted-add
+/// formulation on accelerators (see [`depthwise_conv1d_shifted`]).
+fn depthwise_conv1d(conv: &Conv1d, x: &Tensor) -> candle_core::Result<Tensor> {
+    if matches!(x.device(), Device::Cpu) {
+        conv.forward(x)
+    } else {
+        depthwise_conv1d_shifted(conv, x)
+    }
+}
+
 /// ConvNeXt block (`models/codec/sac/modules/vocos.py::ConvNeXtBlock`):
 /// depthwise conv → LayerNorm (eps 1e-6) → pointwise GELU MLP → layer
 /// scale, residual. `[batch, dim, time]` in/out.
@@ -433,7 +478,7 @@ impl ConvNeXtBlock {
 
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let residual = x;
-        let h = self.dwconv.forward(x)?.transpose(1, 2)?; // [B, T, C]
+        let h = depthwise_conv1d(&self.dwconv, x)?.transpose(1, 2)?; // [B, T, C]
         let h = self.norm.forward(&h.contiguous()?)?;
         let h = self
             .pwconv2
@@ -646,6 +691,42 @@ pub fn load(
 mod tests {
     use super::*;
     use candle_nn::VarMap;
+
+    /// The shifted-add depthwise conv (the CUDA fast path) must match the
+    /// stock grouped conv1d (the CPU / golden-fixture path).
+    #[test]
+    fn depthwise_shifted_matches_grouped_conv() {
+        let dev = Device::Cpu;
+        let dim = 24;
+        let t = 37;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &dev);
+        let conv = conv1d(
+            dim,
+            dim,
+            7,
+            Conv1dConfig {
+                padding: 3,
+                groups: dim,
+                ..Default::default()
+            },
+            vb.pp("dw"),
+        )
+        .unwrap();
+        let x = Tensor::randn(0f32, 1f32, (1, dim, t), &dev).unwrap();
+        let want = conv.forward(&x).unwrap();
+        let got = depthwise_conv1d_shifted(&conv, &x).unwrap();
+        assert_eq!(got.dims(), want.dims());
+        let diff = (got - want)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(diff < 1e-6, "shifted depthwise conv diff {diff}");
+    }
 
     fn tiny_cfg() -> GlmTokenizerConfig {
         GlmTokenizerConfig {

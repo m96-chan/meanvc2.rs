@@ -148,6 +148,8 @@ struct Args {
     monitor: bool,
     denoise: bool,
     duration: Option<f32>,
+    /// Force CPU inference even when built with `--features cuda`.
+    cpu: bool,
 }
 
 fn parse_args() -> Args {
@@ -166,6 +168,7 @@ fn parse_args() -> Args {
         monitor: false,
         denoise: false,
         duration: None,
+        cpu: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(f) = it.next() {
@@ -187,6 +190,7 @@ fn parse_args() -> Args {
             "--wav" => a.wav = Some(it.next().expect("--wav <file>")),
             "--out" => a.out = Some(it.next().expect("--out <file>")),
             "--headless" => a.headless = true,
+            "--cpu" => a.cpu = true,
             "--no-sink" => a.no_sink = true,
             "--monitor" => a.monitor = true,
             "--denoise" => a.denoise = true,
@@ -518,6 +522,32 @@ fn load_voice_print(
     )
 }
 
+/// Device for the X-VC engine: CPU is the project baseline (never
+/// requires a GPU); a build with `--features cuda` places the whole
+/// engine on `cuda:0` when one is present (`--cpu` opts out). The
+/// meanvc engine stays on CPU — it is already real time there.
+#[cfg(feature = "cuda")]
+fn xvc_device(force_cpu: bool) -> Device {
+    if force_cpu {
+        return Device::Cpu;
+    }
+    match Device::new_cuda(0) {
+        Ok(d) => {
+            eprintln!("xvc engine on cuda:0");
+            d
+        }
+        Err(e) => {
+            eprintln!("CUDA unavailable ({e}); falling back to CPU");
+            Device::Cpu
+        }
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+fn xvc_device(_force_cpu: bool) -> Device {
+    Device::Cpu
+}
+
 fn pulse_spec() -> Spec {
     Spec {
         format: Format::FLOAT32NE,
@@ -542,20 +572,33 @@ enum Models {
         spks: Tensor,
     },
     Xvc {
-        engine: Box<xvc::XvcEngine>,
+        /// Shared by the three pipeline stage threads
+        /// ([`xvc::XvcPipelinedStream`]).
+        engine: std::sync::Arc<xvc::XvcEngine>,
         reference: xvc::Reference,
     },
 }
 
 /// The X-VC conversion loop: 240 ms input hops feed the 640/240/100/20
-/// stateless-window streaming driver; each ready window emits 240 ms of
-/// converted waveform (the engine decodes to waveform itself, so there is
-/// no separate vocoder stage). Microphone input is preprocessed
-/// incrementally (sliding-percentile volume normalization + streaming
-/// 40 Hz high-pass); wav input arrives already preprocessed offline.
+/// stateless-window streaming driver in its **pipelined** mode
+/// ([`xvc::XvcPipelinedStream`], issue #38): the semantic / convert /
+/// decode stages of consecutive windows overlap on three threads, so the
+/// sustained throughput requirement is `max(stage) < hop` instead of
+/// `sum(stages) < hop`. Each finished window emits 240 ms of converted
+/// waveform (the engine decodes to waveform itself, so there is no
+/// separate vocoder stage). A hop counts as **late** when it is emitted
+/// more than one hop-period after its schedule slot (first emitted hop +
+/// k·hop), i.e. when it would underrun a one-hop jitter buffer; the
+/// schedule then re-anchors, so one transient stall counts once instead
+/// of permanently flagging every later hop (steady-state pipeline latency
+/// sits ~100 ms above the first, contention-free hop; unbounded drift,
+/// not a constant offset, is what breaks live playback).
+/// Microphone input is preprocessed incrementally (sliding-percentile
+/// volume normalization + streaming 40 Hz high-pass); wav input arrives
+/// already preprocessed offline.
 #[allow(clippy::too_many_arguments)]
 fn run_xvc_conversion(
-    engine: &xvc::XvcEngine,
+    engine: std::sync::Arc<xvc::XvcEngine>,
     reference: xvc::Reference,
     mic_input: bool,
     rx_in: std::sync::mpsc::Receiver<Vec<f32>>,
@@ -566,7 +609,7 @@ fn run_xvc_conversion(
 ) -> anyhow::Result<()> {
     let cfg = xvc::StreamConfig::default();
     let hop = cfg.current_ms as f32 / 1000.0;
-    let mut stream = engine.stream(reference.clone(), cfg)?;
+    let mut stream = xvc::XvcPipelinedStream::new(engine.clone(), reference.clone(), cfg)?;
     let mut hp = HighpassBiquad::new(SR as f64, 40.0);
     let mut norm = MicVolumeNormalizer::new();
     let mut was_passthrough = false;
@@ -574,9 +617,60 @@ fn run_xvc_conversion(
     // drops, so word tails are not clipped.
     const HANGOVER: u32 = 2;
     let mut open_for = 0u32;
+    // Output schedule for the late counter: hop k is due at
+    // `anchor + k·hop`, anchored on the first emitted hop.
+    let mut anchor: Option<Instant> = None;
+    let mut emitted: u64 = 0;
+    // Warm-up grace: the first hops absorb one-off costs (cuda kernel
+    // warmup, pipeline fill); underruns there are not steady-state.
+    const WARMUP_HOPS: u64 = 4;
+
+    // Forwards every finished hop to the output thread.
+    let drain = |stream: &mut xvc::XvcPipelinedStream,
+                 anchor: &mut Option<Instant>,
+                 emitted: &mut u64|
+     -> anyhow::Result<()> {
+        while let Some(step) = stream
+            .try_next()
+            .map_err(|e| anyhow::anyhow!("xvc step: {e}"))?
+        {
+            let now = Instant::now();
+            let due =
+                *anchor.get_or_insert(now) + Duration::from_secs_f64(*emitted as f64 * hop as f64);
+            let t = step.timings;
+            {
+                let mut st = stats.lock().unwrap();
+                st.rtf_asr = t.semantic.as_secs_f32() / hop;
+                st.rtf_vc = t.acoustic.as_secs_f32() / hop;
+                st.rtf_voc = t.decode.as_secs_f32() / hop;
+                st.out_rms = rms(&step.samples);
+                if now > due + Duration::from_secs_f32(hop) {
+                    if *emitted >= WARMUP_HOPS {
+                        st.late += 1;
+                    }
+                    // Jitter-buffer semantics: one underrun event counts
+                    // once, then the schedule re-anchors to the recovered
+                    // timeline. A fixed anchor would flag every subsequent
+                    // hop after a single transient stall, turning the
+                    // counter into a permanent +1/hop tally.
+                    *anchor = Some(now - Duration::from_secs_f64(*emitted as f64 * hop as f64));
+                }
+            }
+            *emitted += 1;
+            let _ = tx_out.send(OutMsg::Raw(step.samples));
+        }
+        Ok(())
+    };
+
     while run.load(Ordering::Relaxed) {
-        let Ok(chunk) = rx_in.recv_timeout(Duration::from_millis(300)) else {
-            continue;
+        let chunk = match rx_in.recv_timeout(Duration::from_millis(50)) {
+            Ok(chunk) => chunk,
+            Err(_) => {
+                // No new input: keep draining the pipeline (end of wav /
+                // mic hiccup) so in-flight hops are not held back.
+                drain(&mut stream, &mut anchor, &mut emitted)?;
+                continue;
+            }
         };
         let passthrough = stats.lock().unwrap().passthrough;
         let in_level = rms(&chunk);
@@ -593,8 +687,9 @@ fn run_xvc_conversion(
         if was_passthrough {
             // Restart the stream timeline: the window history must not
             // carry context across the bypassed audio.
-            stream = engine.stream(reference.clone(), cfg)?;
+            stream = xvc::XvcPipelinedStream::new(engine.clone(), reference.clone(), cfg)?;
             hp = HighpassBiquad::new(SR as f64, 40.0);
+            (anchor, emitted) = (None, 0);
             was_passthrough = false;
         }
 
@@ -618,27 +713,13 @@ fn run_xvc_conversion(
         } else {
             chunk
         };
-        stream.push(&prepared);
+        stream
+            .push(&prepared)
+            .map_err(|e| anyhow::anyhow!("xvc push: {e}"))?;
 
         // The pipeline is windowed, so the converted tail of earlier
         // speech still drains while the gate is closed.
-        while let Some(step) = stream
-            .step()
-            .map_err(|e| anyhow::anyhow!("xvc step: {e}"))?
-        {
-            let t = step.timings;
-            {
-                let mut st = stats.lock().unwrap();
-                st.rtf_asr = t.semantic.as_secs_f32() / hop;
-                st.rtf_vc = t.acoustic.as_secs_f32() / hop;
-                st.rtf_voc = t.decode.as_secs_f32() / hop;
-                st.out_rms = rms(&step.samples);
-                if t.total() > Duration::from_secs_f32(hop) {
-                    st.late += 1;
-                }
-            }
-            let _ = tx_out.send(OutMsg::Raw(step.samples));
-        }
+        drain(&mut stream, &mut anchor, &mut emitted)?;
 
         let mut st = stats.lock().unwrap();
         st.in_rms = in_level;
@@ -695,7 +776,8 @@ fn main() -> anyhow::Result<()> {
             )
         }
         EngineKind::Xvc => {
-            let xeng = xvc::XvcEngine::load("ckpt", &device)
+            let xdev = xvc_device(args.cpu);
+            let xeng = xvc::XvcEngine::load("ckpt", &xdev)
                 .map_err(|e| anyhow::anyhow!("cannot load the X-VC engine: {e}"))?;
             let raw: Vec<f64> = read_wav_16k(&args.reference)?
                 .iter()
@@ -705,7 +787,7 @@ fn main() -> anyhow::Result<()> {
             let reference = xeng.prepare_reference(&target)?;
             (
                 Models::Xvc {
-                    engine: Box::new(xeng),
+                    engine: std::sync::Arc::new(xeng),
                     reference,
                 },
                 None,
@@ -977,7 +1059,7 @@ fn main() -> anyhow::Result<()> {
                 reference,
             } => {
                 return run_xvc_conversion(
-                    &xeng,
+                    xeng,
                     reference,
                     mic_input,
                     rx_in,

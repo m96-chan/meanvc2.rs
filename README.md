@@ -26,8 +26,10 @@ Quit with `q` — or Ctrl-C / SIGTERM, which run the same clean teardown of the 
 
 Pick the engine with `--engine meanvc` (default) or `--engine xvc`
 (multilingual, incl. Japanese — needs the converted X-VC checkpoints in
-`ckpt/`, see [docs/xvc.md](docs/xvc.md); ⚠️ not yet real-time on CPU, see
-the table below). The TUI shows the active engine and its per-stage RTF.
+`ckpt/`, see [docs/xvc.md](docs/xvc.md); real-time on an idle 8-thread
+CPU via the pipelined driver, and comfortably real-time on a GPU with a
+`--features cuda` build — see the table below). The TUI shows the active
+engine and its per-stage RTF.
 
 ## Use cases
 
@@ -42,7 +44,7 @@ the table below). The TUI shows the active engine and its per-stage RTF.
 |---|---|---|
 | [MeanVC v1](docs/meanvc.md) | ✅ working, official weights | ~0.14 RTF end-to-end on CPU, ≈0.6 s latency; Mandarin-trained ([#28](https://github.com/m96-chan/babiniku.rs/issues/28) tracks Japanese) |
 | [MeanVC 2](docs/meanvc.md) | ⏳ implemented, awaiting official weights | 40 ms chunks → ~110 ms latency class |
-| [X-VC](docs/xvc.md) | ⚠️ working, official weights — **not yet real-time on CPU** | codec-space, **multilingual incl. Japanese**; `--engine xvc` in the demo (240 ms hop). Offline RTF 0.69, streaming RTF ≈ 1.75 on 8 CPU threads (semantic 0.50 / convert 0.66 / decode 0.61) — fp32 port of the official stateless driver; q8 + window caching are the Phase-2 levers ([#30](https://github.com/m96-chan/babiniku.rs/issues/30)) |
+| [X-VC](docs/xvc.md) | ✅ working, official weights | Japanese-native quality; **live mic needs the CUDA build** (`--features cuda`, CUDA Toolkit at build time only — RTF ≈ 0.10 on GPU; CPU ≈ 0.9+ falls behind on a busy desktop) |
 | [Zero-VC](docs/zero-vc.md) | 🔍 evaluation | zero-lookahead (20 ms algorithmic latency) — latency-first candidate; no public code yet ([#31](https://github.com/m96-chan/babiniku.rs/issues/31)) |
 
 Every engine is ported weight-compatible and verified stage-by-stage against its official implementation with golden tests (`cargo test --workspace`). Deep dive, APIs, checkpoint setup, performance notes: [docs/meanvc.md](docs/meanvc.md). Issues are labeled by architecture (`meanvc`, `meanvc2`, `demo`, `infra`).

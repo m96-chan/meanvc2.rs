@@ -78,6 +78,17 @@ impl StageTimings {
     }
 }
 
+/// The intermediates of the acoustic stage ([`XvcEngine::acoustic_forward`]).
+#[derive(Debug)]
+pub struct AcousticOutput {
+    /// Quantized acoustic latent, `[1, 1024, frames]` (50 Hz).
+    pub acoustic_zq: Tensor,
+    /// Prenet fusion output, `[1, 1024, frames]`.
+    pub prenet_out: Tensor,
+    /// Converter output latent, `[1, 1024, frames]`.
+    pub converter_out: Tensor,
+}
+
 /// Every intermediate of one window forward
 /// (`run_stream_chunk_forward`) — cheap to return, tensors are refcounted.
 #[derive(Debug)]
@@ -183,20 +194,16 @@ impl XvcEngine {
         })
     }
 
-    /// One full-stack forward (`run_stream_chunk_forward`): preprocessed
-    /// source samples (a multiple of 1280) → converted waveform of the
-    /// same length, with every intermediate and per-stage wall time.
-    pub fn forward_window(&self, samples: &[f32], reference: &Reference) -> Result<WindowOutput> {
+    /// The semantic stage of one window forward: Whisper mel → VQ ids →
+    /// embeddings → 50 Hz semantic latents. Returns
+    /// `(token_ids [1, tokens] i64, sem_up [1, tokens · 4, 1024])`.
+    pub fn semantic_forward(&self, samples: &[f32]) -> Result<(Tensor, Tensor)> {
         if samples.is_empty() || samples.len() % 1280 != 0 {
             return Err(Error::Input(format!(
                 "window length {} must be a non-zero multiple of 1280 samples",
                 samples.len()
             )));
         }
-        let wav_in = Tensor::from_vec(samples.to_vec(), (1, 1, samples.len()), &self.device)?;
-
-        // Semantic branch: Whisper mel → VQ ids → embeddings → 50 Hz.
-        let t0 = Instant::now();
         let feats = self.whisper_mel.extract(samples, &self.device)?;
         let tok = self
             .tokenizer
@@ -207,13 +214,22 @@ impl XvcEngine {
             .forward(&sem_emb.transpose(1, 2)?.contiguous()?)?
             .transpose(1, 2)?
             .contiguous()?; // [1, T50, 1024]
-        let t_semantic = t0.elapsed();
+        Ok((tok.token_ids, sem_up))
+    }
 
-        // Acoustic branch + fusion + conversion.
-        let t0 = Instant::now();
+    /// The acoustic stage: codec encode + prenet fusion + MMDiT
+    /// conversion. `sem_up` is the second output of
+    /// [`Self::semantic_forward`] over the same `samples`.
+    pub fn acoustic_forward(
+        &self,
+        samples: &[f32],
+        sem_up: &Tensor,
+        reference: &Reference,
+    ) -> Result<AcousticOutput> {
+        let wav_in = Tensor::from_vec(samples.to_vec(), (1, 1, samples.len()), &self.device)?;
         let enc = self.codec.encode(&wav_in)?;
         let acu_emb = enc.zq.transpose(1, 2)?.contiguous()?; // [1, T50, 1024]
-        let combined = Tensor::cat(&[&sem_up, &acu_emb], 2)?; // [1, T50, 2048]
+        let combined = Tensor::cat(&[sem_up, &acu_emb], 2)?; // [1, T50, 2048]
         let prenet_out = self
             .prenet
             .forward(&combined.transpose(1, 2)?.contiguous()?)?;
@@ -222,19 +238,47 @@ impl XvcEngine {
             &reference.frame_condition,
             &reference.speaker_condition,
         )?;
+        Ok(AcousticOutput {
+            acoustic_zq: enc.zq,
+            prenet_out,
+            converter_out,
+        })
+    }
+
+    /// The waveform-synthesis stage: converted 50 Hz latents
+    /// `[1, 1024, frames]` → waveform `[1, 1, frames · 320]`.
+    pub fn decode_forward(&self, converter_out: &Tensor) -> Result<Tensor> {
+        self.codec.decode(converter_out)
+    }
+
+    /// One full-stack forward (`run_stream_chunk_forward`): preprocessed
+    /// source samples (a multiple of 1280) → converted waveform of the
+    /// same length, with every intermediate and per-stage wall time.
+    /// Composes [`Self::semantic_forward`], [`Self::acoustic_forward`] and
+    /// [`Self::decode_forward`] — the pipelined driver runs exactly these
+    /// three on separate threads, so outputs are bit-identical.
+    pub fn forward_window(&self, samples: &[f32], reference: &Reference) -> Result<WindowOutput> {
+        // Semantic branch: Whisper mel → VQ ids → embeddings → 50 Hz.
+        let t0 = Instant::now();
+        let (token_ids, sem_up) = self.semantic_forward(samples)?;
+        let t_semantic = t0.elapsed();
+
+        // Acoustic branch + fusion + conversion.
+        let t0 = Instant::now();
+        let acu = self.acoustic_forward(samples, &sem_up, reference)?;
         let t_acoustic = t0.elapsed();
 
         // Waveform synthesis.
         let t0 = Instant::now();
-        let wav = self.codec.decode(&converter_out)?;
+        let wav = self.decode_forward(&acu.converter_out)?;
         let t_decode = t0.elapsed();
 
         Ok(WindowOutput {
-            token_ids: tok.token_ids,
+            token_ids,
             sem_adapter_out: sem_up,
-            acoustic_zq: enc.zq,
-            prenet_out,
-            converter_out,
+            acoustic_zq: acu.acoustic_zq,
+            prenet_out: acu.prenet_out,
+            converter_out: acu.converter_out,
             wav,
             timings: StageTimings {
                 semantic: t_semantic,
@@ -360,18 +404,13 @@ pub struct StreamStep {
     pub timings: StageTimings,
 }
 
-/// The stateless-window streaming driver (`run_streaming`) as an
-/// incremental state machine: [`XvcStream::push`] input samples, then
-/// [`XvcStream::step`] until it returns `None`; [`XvcStream::finish`]
-/// zero-pads and drains the remainder at end of input.
-///
-/// Window `i` covers source samples
-/// `[i·current − history, i·current + current + smooth + future)`
-/// (zero-padded on the left for the first windows), so a hop becomes
-/// ready `smooth + future` ms after its `current` span has been pushed.
-pub struct XvcStream<'a> {
-    engine: &'a XvcEngine,
-    reference: Reference,
+/// Input-side window assembly shared by [`XvcStream`] and
+/// [`XvcPipelinedStream`]: buffers pushed samples and slices out the
+/// `[history | current | smooth | future]` window of each hop
+/// (zero-padded on the left for the first windows and on the right past
+/// the end of input).
+#[derive(Debug)]
+struct Windower {
     cfg: StreamConfig,
     /// Not-yet-dropped input; `buf[0]` is absolute sample `buf_offset`.
     buf: Vec<f32>,
@@ -380,46 +419,22 @@ pub struct XvcStream<'a> {
     pushed: usize,
     /// Next window index.
     next: usize,
-    /// Crossfade tail of the previous window (`smooth_len` samples).
-    tail: Vec<f32>,
-    /// Raised-cosine fade-in table (`smooth_len` samples).
-    fade_in: Vec<f32>,
 }
 
-impl<'a> XvcStream<'a> {
-    fn new(engine: &'a XvcEngine, reference: Reference, cfg: StreamConfig) -> Result<Self> {
+impl Windower {
+    fn new(cfg: StreamConfig) -> Result<Self> {
         cfg.validate()?;
-        let smooth = cfg.smooth_len();
-        // torch.linspace(0, 1, n) includes both endpoints.
-        let fade_in: Vec<f32> = (0..smooth)
-            .map(|i| {
-                let t = if smooth > 1 {
-                    i as f64 / (smooth - 1) as f64
-                } else {
-                    0.0
-                };
-                (0.5 * (1.0 - (std::f64::consts::PI * t).cos())) as f32
-            })
-            .collect();
         Ok(Self {
-            engine,
-            reference,
             cfg,
             buf: Vec::new(),
             buf_offset: 0,
             pushed: 0,
             next: 0,
-            tail: vec![0.0; smooth],
-            fade_in,
         })
     }
 
-    pub fn config(&self) -> &StreamConfig {
-        &self.cfg
-    }
-
     /// Appends preprocessed input samples.
-    pub fn push(&mut self, samples: &[f32]) {
+    fn push(&mut self, samples: &[f32]) {
         self.buf.extend_from_slice(samples);
         self.pushed += samples.len();
     }
@@ -434,8 +449,140 @@ impl<'a> XvcStream<'a> {
     }
 
     /// Whether the next window's full span (incl. lookahead) is buffered.
-    pub fn ready(&self) -> bool {
+    fn ready(&self) -> bool {
         self.window_span(self.next).1 <= self.pushed
+    }
+
+    /// Assembles the next window unconditionally (zero right-pad past the
+    /// pushed input, mirroring the official driver's `right_pad`),
+    /// advances, and drops input no future window can reach. Returns
+    /// `(window index, window samples)`.
+    fn take_next(&mut self) -> (usize, Vec<f32>) {
+        let index = self.next;
+        let (start, end) = self.window_span(index);
+        let mut window = vec![0f32; (end as isize - start) as usize];
+        let left_pad = (-start).max(0) as usize;
+        let from = start.max(0) as usize;
+        for (k, slot) in window.iter_mut().enumerate().skip(left_pad) {
+            let abs = from + (k - left_pad);
+            if abs < self.pushed {
+                *slot = self.buf[abs - self.buf_offset];
+            }
+        }
+        self.next += 1;
+
+        // Drop input no future window can reach.
+        let (next_start, _) = self.window_span(self.next);
+        let keep_from = next_start.max(0) as usize;
+        if keep_from > self.buf_offset {
+            self.buf.drain(..keep_from - self.buf_offset);
+            self.buf_offset = keep_from;
+        }
+        (index, window)
+    }
+
+    /// Total windows of the whole session (`ceil(pushed / current)`,
+    /// matching the official `total_n_chunks`).
+    fn total_windows(&self) -> usize {
+        self.pushed.div_ceil(self.cfg.current_len())
+    }
+}
+
+/// The raised-cosine crossfade state at chunk joins, shared by both
+/// drivers: `smooth_len` samples of the previous window's tail are faded
+/// into the head of the next window's `current` slice (skipped on the
+/// very first window like the official driver).
+#[derive(Debug)]
+struct Crossfader {
+    /// Crossfade tail of the previous window (`smooth_len` samples).
+    tail: Vec<f32>,
+    /// Raised-cosine fade-in table (`smooth_len` samples).
+    fade_in: Vec<f32>,
+}
+
+impl Crossfader {
+    fn new(smooth: usize) -> Self {
+        // torch.linspace(0, 1, n) includes both endpoints.
+        let fade_in: Vec<f32> = (0..smooth)
+            .map(|i| {
+                let t = if smooth > 1 {
+                    i as f64 / (smooth - 1) as f64
+                } else {
+                    0.0
+                };
+                (0.5 * (1.0 - (std::f64::consts::PI * t).cos())) as f32
+            })
+            .collect();
+        Self {
+            tail: vec![0.0; smooth],
+            fade_in,
+        }
+    }
+
+    /// Fades `out`'s head with the stored tail (window 0 is emitted
+    /// untouched) and stores `tail_next` for the next window.
+    fn apply(&mut self, index: usize, out: &mut [f32], tail_next: Vec<f32>) {
+        if index > 0 {
+            for k in 0..self.fade_in.len().min(out.len()) {
+                let w = self.fade_in[k];
+                out[k] = self.tail[k] * (1.0 - w) + out[k] * w;
+            }
+        }
+        self.tail = tail_next;
+    }
+}
+
+/// Extracts the emitted `current` slice and the next crossfade tail from
+/// one decoded window waveform `[1, 1, chunk_len]`.
+fn slice_window_wav(wav: &Tensor, cfg: &StreamConfig) -> Result<(Vec<f32>, Vec<f32>)> {
+    let wav = wav.i((0, 0))?;
+    let out: Vec<f32> = wav
+        .narrow(0, cfg.history_len(), cfg.current_len())?
+        .to_vec1()?;
+    let tail: Vec<f32> = wav
+        .narrow(0, cfg.history_len() + cfg.current_len(), cfg.smooth_len())?
+        .to_vec1()?;
+    Ok((out, tail))
+}
+
+/// The stateless-window streaming driver (`run_streaming`) as an
+/// incremental state machine: [`XvcStream::push`] input samples, then
+/// [`XvcStream::step`] until it returns `None`; [`XvcStream::finish`]
+/// zero-pads and drains the remainder at end of input.
+///
+/// Window `i` covers source samples
+/// `[i·current − history, i·current + current + smooth + future)`
+/// (zero-padded on the left for the first windows), so a hop becomes
+/// ready `smooth + future` ms after its `current` span has been pushed.
+pub struct XvcStream<'a> {
+    engine: &'a XvcEngine,
+    reference: Reference,
+    windower: Windower,
+    fader: Crossfader,
+}
+
+impl<'a> XvcStream<'a> {
+    fn new(engine: &'a XvcEngine, reference: Reference, cfg: StreamConfig) -> Result<Self> {
+        Ok(Self {
+            engine,
+            reference,
+            windower: Windower::new(cfg)?,
+            fader: Crossfader::new(cfg.smooth_len()),
+        })
+    }
+
+    pub fn config(&self) -> &StreamConfig {
+        &self.windower.cfg
+    }
+
+    /// Appends preprocessed input samples.
+    pub fn push(&mut self, samples: &[f32]) {
+        self.windower.push(samples);
+    }
+
+    /// Whether the next window's full span (incl. lookahead) is buffered.
+    pub fn ready(&self) -> bool {
+        self.windower.ready()
     }
 
     /// Runs one window if enough input is buffered.
@@ -447,56 +594,28 @@ impl<'a> XvcStream<'a> {
     }
 
     /// Runs the next window unconditionally, zero-padding missing input
-    /// on the right (used by [`Self::finish`], mirroring the official
-    /// driver's `right_pad`).
+    /// on the right (used by [`Self::finish`]).
     fn step_padded(&mut self) -> Result<Option<StreamStep>> {
-        let (start, end) = self.window_span(self.next);
-        let mut window = vec![0f32; (end as isize - start) as usize];
-        let left_pad = (-start).max(0) as usize;
-        let from = start.max(0) as usize;
-        for (k, slot) in window.iter_mut().enumerate().skip(left_pad) {
-            let abs = from + (k - left_pad);
-            if abs < self.pushed {
-                *slot = self.buf[abs - self.buf_offset];
-            }
-        }
-
-        let cur = self.cfg.current_len();
-        let smooth = self.cfg.smooth_len();
-        let hist = self.cfg.history_len();
+        let cfg = *self.config();
+        let (index, window) = self.windower.take_next();
 
         // Silent windows skip the forward (the demo's input gate emits
         // zero chunks): the decoded window is not exactly zero for zero
         // input, but the emitted slice is silence by construction here.
         let silent = window.iter().all(|&s| s == 0.0);
         let (mut out, tail_next, timings) = if silent {
-            (vec![0f32; cur], vec![0f32; smooth], StageTimings::default())
+            (
+                vec![0f32; cfg.current_len()],
+                vec![0f32; cfg.smooth_len()],
+                StageTimings::default(),
+            )
         } else {
             let fwd = self.engine.forward_window(&window, &self.reference)?;
-            let wav = fwd.wav.i((0, 0))?;
-            let out: Vec<f32> = wav.narrow(0, hist, cur)?.to_vec1()?;
-            let tail: Vec<f32> = wav.narrow(0, hist + cur, smooth)?.to_vec1()?;
+            let (out, tail) = slice_window_wav(&fwd.wav, &cfg)?;
             (out, tail, fwd.timings)
         };
 
-        // Raised-cosine crossfade with the previous tail (skipped on the
-        // very first window like the official driver).
-        if self.next > 0 {
-            for k in 0..smooth.min(out.len()) {
-                let w = self.fade_in[k];
-                out[k] = self.tail[k] * (1.0 - w) + out[k] * w;
-            }
-        }
-        self.tail = tail_next;
-        self.next += 1;
-
-        // Drop input no future window can reach.
-        let (next_start, _) = self.window_span(self.next);
-        let keep_from = next_start.max(0) as usize;
-        if keep_from > self.buf_offset {
-            self.buf.drain(..keep_from - self.buf_offset);
-            self.buf_offset = keep_from;
-        }
+        self.fader.apply(index, &mut out, tail_next);
 
         Ok(Some(StreamStep {
             samples: out,
@@ -510,10 +629,10 @@ impl<'a> XvcStream<'a> {
     /// concatenation trimmed so the whole session output equals the
     /// pushed length.
     pub fn finish(&mut self) -> Result<Vec<f32>> {
-        let cur = self.cfg.current_len();
-        let total_windows = self.pushed.div_ceil(cur);
+        let cur = self.config().current_len();
+        let total_windows = self.windower.total_windows();
         let mut out = Vec::new();
-        while self.next < total_windows {
+        while self.windower.next < total_windows {
             let step = self
                 .step_padded()?
                 .expect("step_padded always yields below total_windows");
@@ -521,8 +640,352 @@ impl<'a> XvcStream<'a> {
         }
         // Total emitted = total_windows · current ≥ pushed: trim the tail.
         let emitted_before = (total_windows - out.len() / cur) * cur;
-        out.truncate(self.pushed.saturating_sub(emitted_before));
+        out.truncate(self.windower.pushed.saturating_sub(emitted_before));
         Ok(out)
+    }
+}
+
+/// A window flowing between two pipeline stages: silent windows bypass
+/// the model but keep their slot in the (order-preserving) channels.
+enum StageMsg<T> {
+    Work {
+        index: usize,
+        payload: T,
+        timings: StageTimings,
+    },
+    Silent {
+        index: usize,
+    },
+}
+
+/// The pipelined streaming driver (issue #38): the same stateless-window
+/// stream as [`XvcStream`], but asynchronous behind channels.
+///
+/// On **CPU** the three stages of [`XvcEngine::forward_window`] —
+/// semantic (mel, tokenizer, adapter), acoustic (codec encode, prenet,
+/// converter) and decode (waveform synthesis) — run on three dedicated
+/// threads connected by bounded channels, so consecutive windows overlap.
+/// Throughput becomes `max(stage)` instead of `sum(stages)` at the cost
+/// of up to two extra hops of latency while the pipeline is full.
+///
+/// On **accelerator devices** (CUDA/Metal) the whole forward runs on a
+/// single worker thread instead: device kernels serialize on one stream
+/// anyway so stage overlap buys nothing, and concurrent op submission
+/// from several host threads is not safe in candle — measured on CUDA it
+/// corrupted the audio non-deterministically (host-side locking around
+/// the forwards is not enough, because kernel launches are asynchronous
+/// and mutex order does not imply stream order for the tensors crossing
+/// threads).
+///
+/// Every window runs exactly the ops of the sequential driver in the same
+/// order, so the output is **bit-identical** to [`XvcStream`]
+/// (`tests/golden_pipeline.rs::pipelined_stream_matches_sequential` on
+/// CPU, `examples/bench_stages.rs` on CUDA).
+///
+/// [`XvcPipelinedStream::push`] input samples (ready windows are enqueued
+/// automatically), drain finished hops with
+/// [`XvcPipelinedStream::try_next`], and call
+/// [`XvcPipelinedStream::finish`] at end of input.
+pub struct XvcPipelinedStream {
+    windower: Windower,
+    /// `None` after `finish` closed the pipeline.
+    tx_job: Option<std::sync::mpsc::SyncSender<StageMsg<Vec<f32>>>>,
+    rx_step: std::sync::mpsc::Receiver<Result<StreamStep>>,
+    /// Steps already handed to the caller (or drained by `finish`).
+    received: usize,
+    handles: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl XvcPipelinedStream {
+    /// Capacity of the inter-stage channels: enough to keep every stage
+    /// busy without letting the backlog (= added latency) grow unbounded.
+    const STAGE_QUEUE: usize = 2;
+
+    pub fn new(
+        engine: std::sync::Arc<XvcEngine>,
+        reference: Reference,
+        cfg: StreamConfig,
+    ) -> Result<Self> {
+        use std::sync::mpsc::{channel, sync_channel};
+        let windower = Windower::new(cfg)?;
+
+        let (tx_job, rx_job) = sync_channel::<StageMsg<Vec<f32>>>(Self::STAGE_QUEUE);
+
+        // Accelerator devices: single worker thread (see the type docs —
+        // multi-thread op submission is unsafe in candle, and stage
+        // overlap buys nothing when kernels serialize on one stream).
+        if !matches!(engine.device(), Device::Cpu) {
+            let (tx_step, rx_step) = channel::<Result<StreamStep>>();
+            let worker = std::thread::Builder::new()
+                .name("xvc-window".into())
+                .spawn(move || {
+                    let mut fader = Crossfader::new(cfg.smooth_len());
+                    while let Ok(msg) = rx_job.recv() {
+                        let out = match msg {
+                            StageMsg::Silent { index } => {
+                                let mut out = vec![0f32; cfg.current_len()];
+                                fader.apply(index, &mut out, vec![0.0; cfg.smooth_len()]);
+                                Ok(StreamStep {
+                                    samples: out,
+                                    timings: StageTimings::default(),
+                                })
+                            }
+                            StageMsg::Work { index, payload, .. } => {
+                                engine.forward_window(&payload, &reference).and_then(|fwd| {
+                                    let (mut out, tail) = slice_window_wav(&fwd.wav, &cfg)?;
+                                    fader.apply(index, &mut out, tail);
+                                    Ok(StreamStep {
+                                        samples: out,
+                                        timings: fwd.timings,
+                                    })
+                                })
+                            }
+                        };
+                        let failed = out.is_err();
+                        if tx_step.send(out).is_err() || failed {
+                            break;
+                        }
+                    }
+                })
+                .map_err(|e| Error::Input(format!("cannot spawn the xvc worker: {e}")))?;
+            return Ok(Self {
+                windower,
+                tx_job: Some(tx_job),
+                rx_step,
+                received: 0,
+                handles: vec![worker],
+            });
+        }
+        let (tx_sem, rx_sem) =
+            sync_channel::<Result<StageMsg<(Vec<f32>, Tensor)>>>(Self::STAGE_QUEUE);
+        let (tx_acu, rx_acu) = sync_channel::<Result<StageMsg<Tensor>>>(Self::STAGE_QUEUE);
+        // Unbounded: finished audio must never block the decode thread.
+        let (tx_step, rx_step) = channel::<Result<StreamStep>>();
+
+        // Stage 1: semantic (Whisper mel → tokenizer → adapter).
+        let eng = engine.clone();
+        let semantic = std::thread::Builder::new()
+            .name("xvc-semantic".into())
+            .spawn(move || {
+                while let Ok(msg) = rx_job.recv() {
+                    let out = match msg {
+                        StageMsg::Silent { index } => Ok(StageMsg::Silent { index }),
+                        StageMsg::Work { index, payload, .. } => {
+                            let t0 = Instant::now();
+                            match eng.semantic_forward(&payload) {
+                                Ok((_ids, sem_up)) => Ok(StageMsg::Work {
+                                    index,
+                                    payload: (payload, sem_up),
+                                    timings: StageTimings {
+                                        semantic: t0.elapsed(),
+                                        ..Default::default()
+                                    },
+                                }),
+                                Err(e) => Err(e),
+                            }
+                        }
+                    };
+                    let failed = out.is_err();
+                    if tx_sem.send(out).is_err() || failed {
+                        break;
+                    }
+                }
+            })
+            .map_err(|e| Error::Input(format!("cannot spawn the semantic stage: {e}")))?;
+
+        // Stage 2: acoustic (codec encode + prenet + converter).
+        let eng = engine.clone();
+        let acoustic = std::thread::Builder::new()
+            .name("xvc-acoustic".into())
+            .spawn(move || {
+                while let Ok(msg) = rx_sem.recv() {
+                    let out = match msg {
+                        Err(e) => Err(e),
+                        Ok(StageMsg::Silent { index }) => Ok(StageMsg::Silent { index }),
+                        Ok(StageMsg::Work {
+                            index,
+                            payload: (window, sem_up),
+                            mut timings,
+                        }) => {
+                            let t0 = Instant::now();
+                            match eng.acoustic_forward(&window, &sem_up, &reference) {
+                                Ok(acu) => {
+                                    timings.acoustic = t0.elapsed();
+                                    Ok(StageMsg::Work {
+                                        index,
+                                        payload: acu.converter_out,
+                                        timings,
+                                    })
+                                }
+                                Err(e) => Err(e),
+                            }
+                        }
+                    };
+                    let failed = out.is_err();
+                    if tx_acu.send(out).is_err() || failed {
+                        break;
+                    }
+                }
+            })
+            .map_err(|e| Error::Input(format!("cannot spawn the acoustic stage: {e}")))?;
+
+        // Stage 3: decode + crossfade (sequential by construction: the
+        // channels preserve window order).
+        let eng = engine;
+        let decode = std::thread::Builder::new()
+            .name("xvc-decode".into())
+            .spawn(move || {
+                let mut fader = Crossfader::new(cfg.smooth_len());
+                while let Ok(msg) = rx_acu.recv() {
+                    let out = match msg {
+                        Err(e) => Err(e),
+                        Ok(StageMsg::Silent { index }) => {
+                            let mut out = vec![0f32; cfg.current_len()];
+                            fader.apply(index, &mut out, vec![0.0; cfg.smooth_len()]);
+                            Ok(StreamStep {
+                                samples: out,
+                                timings: StageTimings::default(),
+                            })
+                        }
+                        Ok(StageMsg::Work {
+                            index,
+                            payload: converter_out,
+                            mut timings,
+                        }) => {
+                            let t0 = Instant::now();
+                            eng.decode_forward(&converter_out)
+                                .and_then(|wav| slice_window_wav(&wav, &cfg))
+                                .map(|(mut out, tail)| {
+                                    timings.decode = t0.elapsed();
+                                    fader.apply(index, &mut out, tail);
+                                    StreamStep {
+                                        samples: out,
+                                        timings,
+                                    }
+                                })
+                        }
+                    };
+                    let failed = out.is_err();
+                    if tx_step.send(out).is_err() || failed {
+                        break;
+                    }
+                }
+            })
+            .map_err(|e| Error::Input(format!("cannot spawn the decode stage: {e}")))?;
+
+        Ok(Self {
+            windower,
+            tx_job: Some(tx_job),
+            rx_step,
+            received: 0,
+            handles: vec![semantic, acoustic, decode],
+        })
+    }
+
+    pub fn config(&self) -> &StreamConfig {
+        &self.windower.cfg
+    }
+
+    /// Sends one assembled window into the pipeline (blocks while the
+    /// input queue is full — i.e. when the pipeline is saturated).
+    fn enqueue(&mut self) -> Result<()> {
+        let (index, window) = self.windower.take_next();
+        let msg = if window.iter().all(|&s| s == 0.0) {
+            StageMsg::Silent { index }
+        } else {
+            StageMsg::Work {
+                index,
+                payload: window,
+                timings: StageTimings::default(),
+            }
+        };
+        self.tx_job
+            .as_ref()
+            .ok_or_else(|| Error::Input("stream already finished".into()))?
+            .send(msg)
+            .map_err(|_| Error::Input("the xvc pipeline stopped (stage thread gone)".into()))
+    }
+
+    /// Appends preprocessed input samples and enqueues every window that
+    /// became ready.
+    pub fn push(&mut self, samples: &[f32]) -> Result<()> {
+        self.windower.push(samples);
+        while self.windower.ready() {
+            self.enqueue()?;
+        }
+        Ok(())
+    }
+
+    /// Returns the next finished hop without blocking (`None` when no hop
+    /// is ready yet). Hops come out in window order.
+    pub fn try_next(&mut self) -> Result<Option<StreamStep>> {
+        match self.rx_step.try_recv() {
+            Ok(step) => {
+                self.received += 1;
+                step.map(Some)
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => Ok(None),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(Error::Input(
+                "the xvc pipeline stopped (stage thread gone)".into(),
+            )),
+        }
+    }
+
+    /// Blocks up to `timeout` for the next finished hop.
+    pub fn next_timeout(&mut self, timeout: Duration) -> Result<Option<StreamStep>> {
+        match self.rx_step.recv_timeout(timeout) {
+            Ok(step) => {
+                self.received += 1;
+                step.map(Some)
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(None),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(Error::Input(
+                "the xvc pipeline stopped (stage thread gone)".into(),
+            )),
+        }
+    }
+
+    /// End of input: enqueues the remaining zero-right-padded windows,
+    /// closes the pipeline, drains every hop not yet consumed and returns
+    /// their concatenation trimmed so the whole session output equals the
+    /// pushed length (same semantics as [`XvcStream::finish`]).
+    pub fn finish(mut self) -> Result<Vec<f32>> {
+        let cur = self.config().current_len();
+        let pushed = self.windower.pushed;
+        let total_windows = self.windower.total_windows();
+        while self.windower.next < total_windows {
+            self.enqueue()?;
+        }
+        // Close the input so the stage threads drain and exit.
+        self.tx_job = None;
+        let mut out = Vec::new();
+        while self.received < total_windows {
+            let step = self
+                .rx_step
+                .recv()
+                .map_err(|_| Error::Input("the xvc pipeline stopped (stage thread gone)".into()))?;
+            out.extend_from_slice(&step?.samples);
+            self.received += 1;
+        }
+        for h in self.handles.drain(..) {
+            let _ = h.join();
+        }
+        // Total emitted = total_windows · current ≥ pushed: trim the tail.
+        let emitted_before = (total_windows - out.len() / cur) * cur;
+        out.truncate(pushed.saturating_sub(emitted_before));
+        Ok(out)
+    }
+}
+
+impl Drop for XvcPipelinedStream {
+    fn drop(&mut self) {
+        // Close the input channel and let the stage threads drain their
+        // in-flight windows and exit; finished steps are discarded by the
+        // dropped receiver.
+        self.tx_job = None;
+        for h in self.handles.drain(..) {
+            let _ = h.join();
+        }
     }
 }
 
@@ -544,6 +1007,67 @@ mod tests {
             ..StreamConfig::default()
         };
         assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn windower_spans_and_padding() {
+        let cfg = StreamConfig::default();
+        let mut w = Windower::new(cfg).unwrap();
+        // Window 0 spans [-history, current + smooth + future).
+        assert_eq!(w.window_span(0), (-(cfg.history_len() as isize), 5_760));
+        assert_eq!(
+            w.window_span(1),
+            (
+                cfg.current_len() as isize - cfg.history_len() as isize,
+                2 * cfg.current_len() + cfg.smooth_len() + cfg.future_len()
+            )
+        );
+        assert!(!w.ready());
+
+        // Ramp input: sample k has value k+1 (nonzero to expose padding).
+        let input: Vec<f32> = (0..2 * cfg.current_len()).map(|k| (k + 1) as f32).collect();
+        w.push(&input[..cfg.current_len()]);
+        assert!(!w.ready(), "window 0 needs smooth+future lookahead");
+        w.push(&input[cfg.current_len()..]);
+        assert!(w.ready());
+
+        let (i0, win0) = w.take_next();
+        assert_eq!(i0, 0);
+        assert_eq!(win0.len(), cfg.chunk_len());
+        // Left zero-pad over the missing history…
+        assert!(win0[..cfg.history_len()].iter().all(|&s| s == 0.0));
+        // …then the pushed samples verbatim.
+        let n = cfg.chunk_len() - cfg.history_len();
+        assert_eq!(win0[cfg.history_len()..], input[..n]);
+
+        // total_windows = ceil(pushed / current).
+        assert_eq!(w.total_windows(), 2);
+        // Window 1 starts at current − history = −640 (still left-padded
+        // with this preset) and is not fully buffered: right side
+        // zero-padded too.
+        assert!(!w.ready());
+        let (i1, win1) = w.take_next();
+        assert_eq!(i1, 1);
+        let left = cfg.history_len() - cfg.current_len();
+        assert!(win1[..left].iter().all(|&s| s == 0.0));
+        assert_eq!(win1[left..left + input.len()], input[..]);
+        assert!(win1[left + input.len()..].iter().all(|&s| s == 0.0));
+    }
+
+    #[test]
+    fn crossfader_first_window_untouched_then_fades() {
+        let mut f = Crossfader::new(4);
+        let mut w0 = vec![1.0f32; 8];
+        f.apply(0, &mut w0, vec![0.5; 4]);
+        assert_eq!(w0, vec![1.0; 8], "window 0 must not be faded");
+        let mut w1 = vec![1.0f32; 8];
+        f.apply(1, &mut w1, vec![0.0; 4]);
+        // Head fades from the stored tail (0.5) to the new window (1.0);
+        // fade_in(0) = 0 → exactly the previous tail at k = 0.
+        assert_eq!(w1[0], 0.5);
+        assert_eq!(w1[3], 1.0, "fade_in end = 1 → fully the new window");
+        assert!(w1[1] > 0.5 && w1[1] < 1.0);
+        assert_eq!(w1[4..], [1.0; 4]);
     }
 
     #[test]

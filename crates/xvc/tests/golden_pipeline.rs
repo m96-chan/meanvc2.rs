@@ -180,6 +180,55 @@ fn offline_matches_e2e_fixture() {
     assert!(ec > 0.995, "offline envelope corr {ec}");
 }
 
+/// The pipelined driver must be bit-identical to the sequential one: the
+/// stage split only moves the same ops onto different threads, so any
+/// difference is a bug (issue #38, stage pipelining).
+#[test]
+fn pipelined_stream_matches_sequential() {
+    let (Some(fx), Some(eng)) = (util::ckpt_fixture("xvc_e2e_fixture.safetensors"), engine())
+    else {
+        return;
+    };
+    let reference = Reference {
+        speaker_condition: fx["speaker_condition"].clone(),
+        frame_condition: fx["frame_condition"].clone(),
+    };
+    let source = samples(&fx["source_wav"]);
+    let cfg = StreamConfig::default();
+
+    // Sequential reference output.
+    let mut seq = eng.stream(reference.clone(), cfg).unwrap();
+    let mut want: Vec<f32> = Vec::with_capacity(source.len());
+    for chunk in source.chunks(cfg.current_len()) {
+        seq.push(chunk);
+        while let Some(step) = seq.step().unwrap() {
+            want.extend_from_slice(&step.samples);
+        }
+    }
+    want.extend_from_slice(&seq.finish().unwrap());
+
+    // Pipelined output over the same hops.
+    let eng = std::sync::Arc::new(eng);
+    let mut pipe = xvc::XvcPipelinedStream::new(eng, reference, cfg).unwrap();
+    let mut got: Vec<f32> = Vec::with_capacity(source.len());
+    for chunk in source.chunks(cfg.current_len()) {
+        pipe.push(chunk).unwrap();
+        while let Some(step) = pipe.try_next().unwrap() {
+            got.extend_from_slice(&step.samples);
+        }
+    }
+    got.extend_from_slice(&pipe.finish().unwrap());
+
+    assert_eq!(got.len(), want.len());
+    let max = got
+        .iter()
+        .zip(&want)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    println!("pipelined vs sequential stream: max abs {max:.2e}");
+    assert_eq!(max, 0.0, "pipelined stream must be bit-identical");
+}
+
 #[test]
 fn stream_cpu_preset_matches_e2e_fixture() {
     let (Some(fx), Some(chain), Some(eng)) = (
