@@ -18,3 +18,8 @@ rustfft = { workspace = true }
 [dev-dependencies]
 anyhow = { workspace = true }
 hound = { workspace = true }
+
+[features]
+default = []
+cuda = ["vc-core/cuda", "candle-core/cuda", "candle-nn/cuda"]
+metal = ["vc-core/metal", "candle-core/metal", "candle-nn/metal"]

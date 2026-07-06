@@ -48,6 +48,7 @@ Fixtures come in two tiers:
 | | `ckpt/pipeline_ref.safetensors` | `v1::KaldiFbank` vs `torchaudio.compliance.kaldi.fbank` (< 1e-3) and the full BNF path vs the official chunked decode loop (< 0.05) | ✅ |
 | `gen_mel_fixture.py` | `fixtures/mel.safetensors` | `MelSpectrogram` vs torchaudio | planned (#8) |
 | `convert_ecapa.py` | — | SpeechBrain ECAPA checkpoint → safetensors + golden output | planned (#8) |
+| `convert_xvc_generator.py` | `ckpt/{xvc_codec,xvc_converter}.safetensors` | official `xvc.pt` generator → safetensors loadable by `xvc::{SacCodec, AcousticConverter}` (official names 1:1, `weight_norm` `g·v/‖v‖` pairs folded into plain conv weights) | ✅ |
 | `gen_xvc_fixtures.py` | `ckpt/xvc_preprocess_fixture.safetensors` | X-VC preprocessing: volume-norm + 40 Hz highpass + pad-to-1280 (< 1e-5) and the Whisper 128-mel log spectrogram (< 1e-4) | ✅ |
 | | `ckpt/xvc_tokenizer_fixture.safetensors` | GLM-4-Voice tokenizer: pre/post-VQ hidden states (< 1e-3), VQ token ids (exact), 50 Hz hidden, `embed_ids`, semantic adapter (< 1e-4) | ✅ |
 | | `ckpt/xvc_speaker_fixture.safetensors` | ERes2Net: Kaldi fbank-80 mean-norm (< 1e-3) → 192-d embedding (cos > 0.9999) | ✅ |
