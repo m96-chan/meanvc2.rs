@@ -53,7 +53,12 @@ const CHUNK_SAMPLES: usize = 3_200; // 200 ms = one CARD chunk (20 mel frames)
 const FBANK_WINDOW: usize = 400; // kaldi 25 ms frame
 const FBANK_SHIFT: usize = 160; // kaldi 10 ms shift
 const BNF_CHUNK: usize = 5; // subsampled BNF frames per CARD chunk
-const MEL_TAIL: usize = 20; // vocoder left context, in mel frames
+const MEL_TAIL: usize = 32; // vocoder left context, in mel frames (320 ms)
+/// Cross-fade length at chunk joins, in samples (10 ms). Each chunk is
+/// vocoded with the mel tail as context, so the window also re-renders the
+/// end of the previous chunk; holding back FADE samples and cross-fading
+/// removes the phase discontinuity at the join.
+const FADE: usize = 160;
 const SINK: &str = "meanvc";
 const VIRT_MIC: &str = "meanvc_mic";
 
@@ -520,6 +525,7 @@ fn main() -> anyhow::Result<()> {
             None => None,
         };
         let mut mel_tail: Option<Tensor> = None;
+        let mut hold: Vec<f32> = Vec::new();
         while run_out.load(Ordering::Relaxed) {
             let Ok(msg) = rx_out.recv_timeout(Duration::from_millis(300)) else {
                 continue;
@@ -535,8 +541,21 @@ fn main() -> anyhow::Result<()> {
                     };
                     let mel01 = ((mel_win.squeeze(0)? + 1.0)? / 2.0)?;
                     let wav = vocos.synthesize(&mel01)?;
-                    let emit = CHUNK_SAMPLES.min(wav.len());
-                    let out: Vec<f32> = wav[wav.len() - emit..].to_vec();
+                    // Cross-fade with the held-back tail of the previous
+                    // chunk (both windows render the overlap region).
+                    let take = (CHUNK_SAMPLES + FADE).min(wav.len());
+                    let cur = &wav[wav.len() - take..];
+                    let mut out: Vec<f32> = Vec::with_capacity(take);
+                    if hold.len() == FADE && take > FADE {
+                        for i in 0..FADE {
+                            let w = i as f32 / FADE as f32;
+                            out.push(hold[i] * (1.0 - w) + cur[i] * w);
+                        }
+                        out.extend_from_slice(&cur[FADE..take - FADE]);
+                    } else {
+                        out.extend_from_slice(&cur[..take - FADE]);
+                    }
+                    hold = cur[take - FADE..].to_vec();
                     mel_tail =
                         Some(mel.narrow(1, 20usize.saturating_sub(MEL_TAIL), MEL_TAIL.min(20))?);
                     let mut st = stats_out.lock().unwrap();
@@ -550,7 +569,9 @@ fn main() -> anyhow::Result<()> {
             let semi = controls_out.pitch_decisemitones.load(Ordering::Relaxed) as f32 / 10.0;
             let chunk: Vec<f32> = if semi.abs() > 0.05 {
                 if (semi - current_semi).abs() > 0.01 {
-                    stretch.set_transpose_factor_semitones(semi, None);
+                    // Tonality limit ~8 kHz/sample-rate is the recommended
+                    // setting for voice (reduces warble on shifted speech).
+                    stretch.set_transpose_factor_semitones(semi, Some(8_000.0 / SR as f32));
                     current_semi = semi;
                 }
                 let mut shifted = vec![0f32; chunk.len()];
