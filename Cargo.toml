@@ -27,6 +27,7 @@ hound = { version = "3", optional = true }
 [dev-dependencies]
 anyhow = "1"
 hound = "3"
+num_cpus = "1"
 
 [features]
 default = []

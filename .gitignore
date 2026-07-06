@@ -5,5 +5,5 @@ Cargo.lock
 # committed golden fixtures (small, deterministic)
 !tools/fixtures/*.safetensors
 
-# local checkpoints for the v1 demo
-/ckpt/
+# local checkpoints + generated v1 parity fixtures (may be a symlink)
+/ckpt

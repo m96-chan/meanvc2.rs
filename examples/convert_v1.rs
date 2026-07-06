@@ -37,6 +37,13 @@ fn read_wav(path: &str) -> anyhow::Result<Vec<f32>> {
 }
 
 fn main() -> anyhow::Result<()> {
+    // candle's CPU gemm uses a rayon pool that defaults to all logical
+    // cores; on SMT machines the contention roughly triples small-chunk
+    // latency (measured: vocoder chunk RTF 0.57 -> 0.06 with the pool
+    // pinned to physical cores). Must run before the first tensor op.
+    if std::env::var_os("RAYON_NUM_THREADS").is_none() {
+        std::env::set_var("RAYON_NUM_THREADS", num_cpus::get_physical().to_string());
+    }
     let args: Vec<String> = std::env::args().collect();
     let (src_path, ref_path, out_path) = match args.as_slice() {
         [_, s, r, o] => (s.clone(), r.clone(), o.clone()),
