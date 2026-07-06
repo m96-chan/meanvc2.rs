@@ -37,7 +37,8 @@ Live TUI knobs while you speak: pitch (`[` `]`), noise suppression (`,` `.`), in
 |---|---|---|
 | [MeanVC v1](docs/meanvc.md) | ✅ working, official weights | ~0.14 RTF end-to-end on CPU, ≈0.6 s latency; Mandarin-trained ([#28](https://github.com/m96-chan/babiniku.rs/issues/28) tracks Japanese) |
 | [MeanVC 2](docs/meanvc.md) | ⏳ implemented, awaiting official weights | 40 ms chunks → ~110 ms latency class |
-| X-VC | 🔍 evaluation | codec-space, multilingual — candidate for language-agnostic conversion |
+| [X-VC](docs/xvc.md) | 🔍 evaluation | codec-space, multilingual — candidate for language-agnostic conversion ([#30](https://github.com/m96-chan/babiniku.rs/issues/30)) |
+| [Zero-VC](docs/zero-vc.md) | 🔍 evaluation | zero-lookahead (20 ms algorithmic latency) — latency-first candidate; no public code yet ([#31](https://github.com/m96-chan/babiniku.rs/issues/31)) |
 
 Every engine is ported weight-compatible and verified stage-by-stage against its official implementation with golden tests (`cargo test`). Deep dive, APIs, checkpoint setup, performance notes: [docs/meanvc.md](docs/meanvc.md). Issues are labeled by architecture (`meanvc`, `meanvc2`, `demo`, `infra`).
 
