@@ -376,15 +376,25 @@ impl Exciter {
             };
             self.gain_state += alpha * (target - self.gain_state);
             if wet_now > 0.0 {
-                // Hard-bound the synthetic band by the source-band
-                // envelope: whatever the gain state, the added sample can
-                // never exceed the band's own level — spikes are clamped
-                // at the physics level (field report: ticks during
+                // Bound the synthetic band by the source-band envelope:
+                // whatever the gain state, the added sample can never
+                // exceed the band's own level (field report: ticks during
                 // sustained vowels came from gain*harm bursts, not from
-                // waveform steps).
+                // waveform steps). Soft saturation, not a hard clamp — a
+                // hard clamp flat-tops the band at every glottal pulse,
+                // and those edges are themselves broadband ticks.
+                // Identity below the knee (no intermodulation on normal
+                // content), C1-smooth saturation above it.
                 let add = Self::TARGET_RATIO * self.gain_state * harm;
-                let bound = 1.5 * se;
-                *s = x + wet_now * add.clamp(-bound, bound);
+                let bound = 1.5 * se + 1e-12;
+                let u = add / bound;
+                let knee = 0.75f32;
+                let soft = if u.abs() <= knee {
+                    u
+                } else {
+                    u.signum() * (knee + (1.0 - knee) * ((u.abs() - knee) / (1.0 - knee)).tanh())
+                };
+                *s = x + wet_now * bound * soft;
             }
         }
         self.prev_wet = wet;

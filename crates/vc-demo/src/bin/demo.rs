@@ -1024,7 +1024,21 @@ fn main() -> anyhow::Result<()> {
                     "capture",
                     &pulse_spec(),
                     None,
-                    None,
+                    // Generous capture buffering: a transient pipeline
+                    // stall (GPU hiccup, scheduler burp) back-pressures the
+                    // input thread; with the default fragsize the server
+                    // then drops mic samples, splicing a discontinuity
+                    // into the INPUT that converts into an audible tick
+                    // (issue #42 third field recording: mid-level clicks
+                    // with 0.27 sample steps, no clipping, live only).
+                    // 2 s of slack absorbs any realistic stall.
+                    Some(&libpulse_binding::def::BufferAttr {
+                        maxlength: SR as u32 * 4 * 2, // 2 s of f32 mono
+                        tlength: u32::MAX,
+                        prebuf: u32::MAX,
+                        minreq: u32::MAX,
+                        fragsize: (chunk_samples * 4) as u32,
+                    }),
                 )
                 .map_err(|e| anyhow::anyhow!("pulse record: {e}"))?;
                 let mut buf = vec![0u8; chunk_samples * 4];
