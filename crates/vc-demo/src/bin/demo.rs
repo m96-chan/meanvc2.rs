@@ -147,6 +147,7 @@ struct Stats {
     chunks: u64,
     late: u64,
     gated: u64,
+    declicks: u64,
     passthrough: bool,
     status: String,
 }
@@ -655,6 +656,7 @@ fn run_xvc_conversion(
     // drops, so word tails are not clipped.
     const HANGOVER: u32 = 2;
     let mut open_for = 0u32;
+    let mut prev_gated = false;
     // Output schedule for the late counter: hop k is due at
     // `anchor + k·hop`, anchored on the first emitted hop.
     let mut anchor: Option<Instant> = None;
@@ -741,7 +743,7 @@ fn run_xvc_conversion(
         open_for = open_for.saturating_sub(1);
         let gated = open_for == 0;
 
-        let prepared: Vec<f32> = if gated {
+        let mut prepared: Vec<f32> = if gated {
             vec![0.0; chunk.len()]
         } else if mic_input {
             let mut c64: Vec<f64> = chunk.iter().map(|&s| s as f64).collect();
@@ -749,8 +751,28 @@ fn run_xvc_conversion(
             hp.process(&mut c64);
             c64.iter().map(|&s| s as f32).collect()
         } else {
-            chunk
+            chunk.clone()
         };
+        // Deterministic splice fades at gate transitions: the first gated
+        // chunk fades the real audio out (instead of a hard cut to zeros)
+        // and the first open chunk fades in — no blind discontinuity
+        // detection, so continuous audio is never touched.
+        const SPLICE_FADE: usize = 160; // 10 ms at 16 kHz
+        if gated && !prev_gated {
+            stats.lock().unwrap().declicks += 1;
+            let n = SPLICE_FADE.min(chunk.len());
+            for i in 0..n {
+                let w = 1.0 - i as f32 / n as f32;
+                prepared[i] = chunk[i] * w * w;
+            }
+        } else if !gated && prev_gated {
+            let n = SPLICE_FADE.min(prepared.len());
+            for (i, s) in prepared.iter_mut().take(n).enumerate() {
+                let w = i as f32 / n as f32;
+                *s *= w * w;
+            }
+        }
+        prev_gated = gated;
         stream
             .push(&prepared)
             .map_err(|e| anyhow::anyhow!("xvc push: {e}"))?;
@@ -1020,7 +1042,6 @@ fn main() -> anyhow::Result<()> {
         };
         let mut mel_tail: Option<Tensor> = None;
         let mut hold: Vec<f32> = Vec::new();
-        let mut last_out: f32 = 0.0;
         while run_out.load(Ordering::Relaxed) {
             let Ok(msg) = rx_out.recv_timeout(Duration::from_millis(300)) else {
                 continue;
@@ -1061,23 +1082,6 @@ fn main() -> anyhow::Result<()> {
                     out
                 }
             };
-            // Output declicker: gate/passthrough transitions splice
-            // unrelated audio (e.g. speech tail -> hard zeros), and the
-            // exciter makes the resulting step's broadband splash audible
-            // as a tick. Smooth any inter-chunk discontinuity over ~5 ms.
-            let mut chunk = chunk;
-            {
-                const DECLICK: usize = 80; // 5 ms at 16 kHz
-                let step = chunk.first().map_or(0.0, |&x0| x0 - last_out);
-                if step.abs() > 0.02 {
-                    for (i, s) in chunk.iter_mut().take(DECLICK).enumerate() {
-                        let w = i as f32 / DECLICK as f32;
-                        // Raised-cosine decay of the step offset (1 -> 0).
-                        *s -= step * (0.5 + 0.5 * (std::f32::consts::PI * w).cos());
-                    }
-                }
-                last_out = *chunk.last().unwrap_or(&last_out);
-            }
             // Post-vocoder pitch shift (Signalsmith Stretch), bypassed at 0
             // to avoid its internal latency.
             let semi = controls_out.pitch_decisemitones.load(Ordering::Relaxed) as f32 / 10.0;
@@ -1285,7 +1289,7 @@ fn main() -> anyhow::Result<()> {
             let st = stats.lock().unwrap();
             let names = engine.stage_names();
             eprint!(
-                "\r[{}] chunks {:4}  in {:.3} out {:.3}  RTF {} {:.2} {} {:.2} {} {:.2}  late {}   ",
+                "\r[{}] chunks {:4}  in {:.3} out {:.3}  RTF {} {:.2} {} {:.2} {} {:.2}  late {} dc {}   ",
                 engine.name(),
                 st.chunks,
                 st.in_rms,
@@ -1296,7 +1300,7 @@ fn main() -> anyhow::Result<()> {
                 st.rtf_vc,
                 names[2],
                 st.rtf_voc,
-                st.late
+                st.late, st.declicks
             );
             std::io::stderr().flush().ok();
         }
