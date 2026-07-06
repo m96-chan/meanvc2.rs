@@ -128,7 +128,7 @@ cargo run --release --features demo --bin meanvc-demo -- \
     --reference target_voice.wav --voice-print voice_print.safetensors
 ```
 
-TUI shows level meters, per-stage RTF, and supports `p` (passthrough A/B), `l` (loopback monitor — hear the converted voice on your speakers), `q` (quit; removes the virtual device). `--monitor` starts with the loopback on. `--wav file.wav` streams a file instead of the mic, `--headless` / `--out out.wav` / `--duration N` support scripted runs. Requires the checkpoints under `ckpt/` (see `examples/convert_v1.rs`) and `pactl`. Measured on a single CPU: VC stage RTF ≈ 0.57 and vocoder RTF ≈ 0.57 running pipelined — sustained real time with ~0.6 s latency.
+TUI shows level meters, per-stage RTF, and supports `p` (passthrough A/B), `l` (loopback monitor — hear the converted voice on your speakers), `q` (quit; removes the virtual device). `--monitor` starts with the loopback on. `--wav file.wav` streams a file instead of the mic, `--headless` / `--out out.wav` / `--duration N` support scripted runs. Requires the checkpoints under `ckpt/` (see `examples/convert_v1.rs`) and `pactl`. The ASR stage streams incrementally with `FastU2pp::forward_chunk` (per-layer attention K/V + conv caches, exact WeNet `forward_chunk` parity — issue #9). Measured with `RAYON_NUM_THREADS=8`: per-stage RTF ≈ 0.06 (ASR) / 0.04 (VC) / 0.06 (vocoder), late = 0 sustained.
 
 ## Performance notes
 
@@ -167,6 +167,7 @@ This is an **unofficial, experimental** implementation written from the paper �
 - [x] Vocos / Fast-U2++ / ECAPA-TDNN inference backends (candle ports; checkpoint conversion + golden tests in [#8](https://github.com/m96-chan/meanvc2.rs/issues/8))
 - [x] MeanVC v1 model (`meanvc2::v1`): MRTE, CARD, RoPE + rms-qk-norm ChunkDiT — official parameter tree, 14.1M params vs the paper's 14M ([#12](https://github.com/m96-chan/meanvc2.rs/issues/12))
 - [x] MeanVC v1 official weights load + real wav-to-wav example (`cargo run --release --example convert_v1`), with stage-by-stage PyTorch parity locked in by golden tests against the official implementation — DiT forward, KV-cache streaming, mel, Vocos, kaldi fbank, and the BNF pipeline ([#14](https://github.com/m96-chan/meanvc2.rs/issues/14); fixtures via `tools/gen_v1_fixtures.py`, see [`tools/README.md`](tools/README.md))
+- [x] Incremental Fast-U2++ streaming: `FastU2pp::forward_chunk` with per-layer attention-K/V and depthwise-conv caches, matching the official TorchScript chunked decode to 3e-6 (`tests/asr_streaming.rs`; chunk-cached Vocos still open in [#9](https://github.com/m96-chan/meanvc2.rs/issues/9))
 - [ ] MeanVC 2 pretrained weights (official release pending; training loop [#3](https://github.com/m96-chan/meanvc2.rs/issues/3) as fallback)
 
 Known deviations from the paper (details in the module docs):

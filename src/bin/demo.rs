@@ -19,12 +19,11 @@
 //! the virtual device, `--monitor` starts with the loopback enabled,
 //! `--duration <secs>` auto-stops (for testing).
 //!
-//! Approximations vs the offline path (tracked in #9): BNFs come from a
-//! rolling 1.6 s analysis window instead of full incremental caches, and
-//! the vocoder re-synthesizes each chunk with a 200 ms mel tail as
-//! context.
+//! BNFs are extracted with the incremental `FastU2pp::forward_chunk`
+//! streaming caches (issue #9), bit-matching the official WeNet chunked
+//! decode; the remaining approximation is the vocoder, which re-synthesizes
+//! each chunk with a 200 ms mel tail as context (tracked in #9).
 
-use std::collections::VecDeque;
 use std::io::Write as _;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -41,7 +40,9 @@ use meanvc2::v1::{interpolate_linear, KaldiFbank, KvCache, MeanVc1, MeanVc1Confi
 
 const SR: usize = 16_000;
 const CHUNK_SAMPLES: usize = 3_200; // 200 ms = one CARD chunk (20 mel frames)
-const HISTORY_SAMPLES: usize = 19_200; // 1.2 s rolling ASR window
+const FBANK_WINDOW: usize = 400; // kaldi 25 ms frame
+const FBANK_SHIFT: usize = 160; // kaldi 10 ms shift
+const BNF_CHUNK: usize = 5; // subsampled BNF frames per CARD chunk
 const MEL_TAIL: usize = 20; // vocoder left context, in mel frames
 const SINK: &str = "meanvc";
 const VIRT_MIC: &str = "meanvc_mic";
@@ -104,7 +105,10 @@ fn parse_args() -> Args {
 /// Creates the null sink + remapped virtual microphone; returns module ids.
 fn create_virtual_device() -> anyhow::Result<Vec<String>> {
     let load = |args: &[&str]| -> anyhow::Result<String> {
-        let out = Command::new("pactl").arg("load-module").args(args).output()?;
+        let out = Command::new("pactl")
+            .arg("load-module")
+            .args(args)
+            .output()?;
         anyhow::ensure!(
             out.status.success(),
             "pactl load-module failed: {}",
@@ -210,13 +214,21 @@ fn main() -> anyhow::Result<()> {
     let device = Device::Cpu;
 
     eprintln!("loading models…");
-    let model = MeanVc1::load(MeanVc1Config::default(), "ckpt/model_200ms.safetensors", &device)?;
+    let model = MeanVc1::load(
+        MeanVc1Config::default(),
+        "ckpt/model_200ms.safetensors",
+        &device,
+    )?;
     let asr = FastU2pp::load(
         FastU2ppConfig::official_meanvc1(),
         "ckpt/fastu2pp.safetensors",
         &device,
     )?;
-    let vocos = Vocos::load(VocosConfig::official_meanvc1(), "ckpt/vocos.safetensors", &device)?;
+    let vocos = Vocos::load(
+        VocosConfig::official_meanvc1(),
+        "ckpt/vocos.safetensors",
+        &device,
+    )?;
     let reference = read_wav_16k(&args.reference)?;
     let prompt_mel = MelV1::new().compute(&reference, &device)?.unsqueeze(0)?;
     let vp = candle_core::safetensors::load(&args.voice_print, &device)?;
@@ -238,7 +250,9 @@ fn main() -> anyhow::Result<()> {
 
     let stats = Arc::new(Mutex::new(Stats {
         status: if sink_ok {
-            format!("virtual mic \"{VIRT_MIC}\" is live — select \"MeanVC-Virtual-Mic\" in your app")
+            format!(
+                "virtual mic \"{VIRT_MIC}\" is live — select \"MeanVC-Virtual-Mic\" in your app"
+            )
         } else {
             "virtual sink disabled (--no-sink)".into()
         },
@@ -387,7 +401,11 @@ fn main() -> anyhow::Result<()> {
     let run_vc = run.clone();
     let vc = std::thread::spawn(move || -> anyhow::Result<()> {
         let fbank = KaldiFbank::new();
-        let mut history: VecDeque<f32> = VecDeque::with_capacity(HISTORY_SAMPLES);
+        // Incremental front end: raw-sample carry for the fbank framing and
+        // the Fast-U2++ streaming caches (att K/V + conv left context).
+        let mut sample_buf: Vec<f32> = Vec::with_capacity(2 * CHUNK_SAMPLES);
+        let mut asr_state = asr.stream();
+        let mut bnf_pending: Option<Tensor> = None;
         let mut kv = KvCache::default();
         let mut prev_mel: Option<Tensor> = None;
         let mut q = 0usize;
@@ -398,6 +416,11 @@ fn main() -> anyhow::Result<()> {
             let passthrough = stats_vc.lock().unwrap().passthrough;
             let in_level = rms(&chunk);
             if passthrough {
+                // Drop the streaming state: the ASR caches must not carry
+                // context across the bypassed audio.
+                sample_buf.clear();
+                asr_state.reset();
+                bnf_pending = None;
                 let mut st = stats_vc.lock().unwrap();
                 st.in_rms = in_level;
                 st.out_rms = in_level;
@@ -406,34 +429,56 @@ fn main() -> anyhow::Result<()> {
                 let _ = tx_out.send(OutMsg::Raw(chunk));
                 continue;
             }
-            history.extend(chunk.iter().copied());
-            while history.len() > HISTORY_SAMPLES {
-                history.pop_front();
-            }
-            let hist: Vec<f32> = history.iter().copied().collect();
-            if hist.len() < CHUNK_SAMPLES * 2 {
-                continue; // need context before the first chunk
-            }
 
-            // BNFs for the newest 200 ms from the rolling window.
+            // Incremental fbank: frames are window-local, so computing them
+            // over the carried buffer and draining whole shifts is exact.
             let t0 = Instant::now();
-            let fb = fbank.compute(&hist, &device)?.unsqueeze(0)?;
-            let bn = asr.forward(&fb)?;
-            let n_sub = bn.dim(1)?;
-            let bn5 = bn.narrow(1, n_sub - 5, 5)?;
-            let cond = interpolate_linear(&bn5, 4)?; // [1, 20, 256]
+            sample_buf.extend_from_slice(&chunk);
+            if sample_buf.len() >= FBANK_WINDOW {
+                let fb = fbank.compute(&sample_buf, &device)?.unsqueeze(0)?;
+                let consumed = fb.dim(1)? * FBANK_SHIFT;
+                sample_buf.drain(..consumed);
+                // Streaming BNFs with per-layer caches (one 23-frame window
+                // with stride 20 per 200 ms chunk after warm-up).
+                if let Some(bn) = asr.forward_chunk(&fb, &mut asr_state)? {
+                    bnf_pending = Some(match bnf_pending.take() {
+                        Some(prev) => Tensor::cat(&[&prev, &bn], 1)?,
+                        None => bn,
+                    });
+                }
+            }
             let t_asr = t0.elapsed();
 
-            // CARD chunk with streaming KV cache.
-            let t0 = Instant::now();
-            let timbre = model.timbre_cond(&cond, &prompt_mel, &spks)?;
-            let noise = Tensor::randn(0f32, 1f32, (1, 20, 80), &device)?;
-            let u = model.forward_stream(&noise, &timbre, &spks, prev_mel.as_ref(), q * 20, &mut kv)?;
-            let mel = (noise - u)?;
-            let t_vc = t0.elapsed();
+            let mut t_vc = Duration::ZERO;
+            let mut mels = Vec::new();
+            while bnf_pending.as_ref().map_or(0, |t| t.dim(1).unwrap_or(0)) >= BNF_CHUNK {
+                let pending = bnf_pending.take().unwrap();
+                let bn5 = pending.narrow(1, 0, BNF_CHUNK)?;
+                let rest = pending.dim(1)? - BNF_CHUNK;
+                bnf_pending = (rest > 0)
+                    .then(|| pending.narrow(1, BNF_CHUNK, rest))
+                    .transpose()?;
+                let cond = interpolate_linear(&bn5, 4)?; // [1, 20, 256]
 
-            prev_mel = Some(mel.clone());
-            q += 1;
+                // CARD chunk with streaming KV cache.
+                let t0 = Instant::now();
+                let timbre = model.timbre_cond(&cond, &prompt_mel, &spks)?;
+                let noise = Tensor::randn(0f32, 1f32, (1, 20, 80), &device)?;
+                let u = model.forward_stream(
+                    &noise,
+                    &timbre,
+                    &spks,
+                    prev_mel.as_ref(),
+                    q * 20,
+                    &mut kv,
+                )?;
+                let mel = (noise - u)?;
+                t_vc += t0.elapsed();
+
+                prev_mel = Some(mel.clone());
+                q += 1;
+                mels.push(mel);
+            }
 
             // The VC stage must stay under one chunk period; the vocoder
             // runs concurrently in the output thread.
@@ -442,13 +487,17 @@ fn main() -> anyhow::Result<()> {
                 let mut st = stats_vc.lock().unwrap();
                 st.in_rms = in_level;
                 st.rtf_asr = t_asr.as_secs_f32() / 0.2;
-                st.rtf_vc = t_vc.as_secs_f32() / 0.2;
+                if !mels.is_empty() {
+                    st.rtf_vc = t_vc.as_secs_f32() / (0.2 * mels.len() as f32);
+                }
                 st.chunks += 1;
                 if total > Duration::from_millis(200) {
                     st.late += 1;
                 }
             }
-            let _ = tx_out.send(OutMsg::Mel(mel));
+            for mel in mels {
+                let _ = tx_out.send(OutMsg::Mel(mel));
+            }
         }
         Ok(())
     });
@@ -472,7 +521,13 @@ fn main() -> anyhow::Result<()> {
         }
         eprintln!();
     } else {
-        run_tui(stats.clone(), run.clone(), monitor.clone(), sink_ok, args.duration)?;
+        run_tui(
+            stats.clone(),
+            run.clone(),
+            monitor.clone(),
+            sink_ok,
+            args.duration,
+        )?;
     }
 
     run.store(false, Ordering::Relaxed);
@@ -543,7 +598,11 @@ fn run_tui(
             );
             f.render_widget(
                 Gauge::default()
-                    .block(Block::default().borders(Borders::ALL).title(" converted out "))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(" converted out "),
+                    )
                     .gauge_style(Style::new().fg(Color::Cyan))
                     .percent(level(snapshot.1)),
                 rows[1],
@@ -551,8 +610,16 @@ fn run_tui(
             let total = snapshot.2 + snapshot.3 + snapshot.4;
             f.render_widget(
                 Gauge::default()
-                    .block(Block::default().borders(Borders::ALL).title(" total RTF (must stay < 1.0) "))
-                    .gauge_style(Style::new().fg(if total < 1.0 { Color::Green } else { Color::Red }))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(" total RTF (must stay < 1.0) "),
+                    )
+                    .gauge_style(Style::new().fg(if total < 1.0 {
+                        Color::Green
+                    } else {
+                        Color::Red
+                    }))
                     .percent(((total).min(1.5) * 66.6) as u16)
                     .label(format!("{total:.2}")),
                 rows[2],
@@ -574,9 +641,17 @@ fn run_tui(
                 Paragraph::new(format!(
                     "{}\n[q] quit   [p] passthrough   [l] loopback monitor: {}",
                     snapshot.8,
-                    if monitoring { "ON (hearing converted voice)" } else { "off" }
+                    if monitoring {
+                        "ON (hearing converted voice)"
+                    } else {
+                        "off"
+                    }
                 ))
-                    .block(Block::default().borders(Borders::ALL).title(" MeanVC virtual mic ")),
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" MeanVC virtual mic "),
+                ),
                 rows[4],
             );
         })?;
