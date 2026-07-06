@@ -28,6 +28,8 @@ thiserror = "2"
 anyhow = "1"
 hound = "3"
 num_cpus = "1"
+# Signal handling for the demo teardown (SIGINT + SIGTERM via "termination").
+ctrlc = { version = "3.4", features = ["termination"] }
 ort = "2.0.0-rc.10"
 
 [profile.release]

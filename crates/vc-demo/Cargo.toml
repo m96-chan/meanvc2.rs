@@ -17,6 +17,7 @@ meanvc = { workspace = true }
 xvc = { workspace = true }
 candle-core = { workspace = true }
 anyhow = { workspace = true }
+ctrlc = { workspace = true }
 num_cpus = { workspace = true }
 hound = { workspace = true }
 ratatui = "0.29"

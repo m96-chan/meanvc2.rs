@@ -22,6 +22,8 @@ cargo run --release -p vc-demo --features wavlm --bin babiniku-demo -- \
 
 Live TUI knobs while you speak: pitch (`[` `]`), noise suppression (`,` `.`), input gate (`-` `=`), passthrough A/B (`p`), self-monitor (`l`).
 
+Quit with `q` — or Ctrl-C / SIGTERM, which run the same clean teardown of the virtual devices; stale `babiniku` devices left by a killed run are recovered automatically at the next startup.
+
 Pick the engine with `--engine meanvc` (default) or `--engine xvc`
 (multilingual, incl. Japanese — needs the converted X-VC checkpoints in
 `ckpt/`, see [docs/xvc.md](docs/xvc.md); ⚠️ not yet real-time on CPU, see

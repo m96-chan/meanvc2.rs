@@ -14,7 +14,7 @@
 //!     --engine xvc --reference her_voice.wav
 //! ```
 //!
-//! Keys: `q` quit · `p` passthrough (bypass conversion for A/B) ·
+//! Keys: `q` (or Ctrl-C) quit · `p` passthrough (bypass conversion for A/B) ·
 //! `l` loopback monitor (hear the converted voice on the default output) ·
 //! `[` / `]` pitch shift −/+0.5 semitone (post-vocoder, Signalsmith
 //! Stretch) · `,` / `.` RNNoise denoise mix −/+10 % (pre-ASR, in-process;
@@ -29,6 +29,11 @@
 //! additionally records the converted audio, `--no-sink` skips creating
 //! the virtual device, `--monitor` starts with the loopback enabled,
 //! `--duration <secs>` auto-stops (for testing).
+//!
+//! Shutdown: SIGINT (Ctrl-C) and SIGTERM run the same clean teardown as
+//! `q`, unloading every pactl module the demo created; stale
+//! babiniku-named modules left behind by a killed run are recovered
+//! (unloaded) at startup before fresh devices are created (issue #39).
 //!
 //! BNFs are extracted with the incremental `FastU2pp::forward_chunk`
 //! streaming caches (issue #9), bit-matching the official WeNet chunked
@@ -361,6 +366,60 @@ fn destroy_virtual_device(modules: &[String]) {
     }
 }
 
+/// Parses `pactl list modules short` output (`id\tname\targuments`) and
+/// returns the `(id, name)` of every module that owns one of our device
+/// names — leftovers from a previous run that was killed before teardown
+/// (issue #39). Matching is exact on whole argument tokens
+/// (`sink_name=babiniku` etc.), so devices that merely contain the word
+/// are left alone.
+fn stale_babiniku_modules(listing: &str) -> Vec<(String, String)> {
+    let owned = [
+        format!("sink_name={SINK}"),
+        format!("source_name={VIRT_MIC}"),
+        format!("source_name={DENOISED_SRC}"),
+        format!("source={SINK}.monitor"),
+    ];
+    listing
+        .lines()
+        .filter_map(|line| {
+            let mut cols = line.splitn(3, '\t');
+            let id = cols.next()?.trim();
+            let name = cols.next()?.trim();
+            let args = cols.next().unwrap_or("");
+            args.split_whitespace()
+                .any(|kv| owned.iter().any(|o| kv == o))
+                .then(|| (id.to_string(), name.to_string()))
+        })
+        .collect()
+}
+
+/// Belt-and-braces startup recovery: unloads the stale modules found by
+/// [`stale_babiniku_modules`] before fresh devices are created, and logs
+/// what was recovered. Dependents (remap source, loopback) were loaded
+/// after the null sink, so unloading in reverse listing order tears them
+/// down first; a module that already disappeared is not an error.
+fn recover_stale_modules() {
+    let out = Command::new("pactl")
+        .args(["list", "modules", "short"])
+        .output();
+    let listing = match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        // No pulse daemon — device creation will report the real error.
+        _ => return,
+    };
+    for (id, name) in stale_babiniku_modules(&listing).iter().rev() {
+        let ok = Command::new("pactl")
+            .args(["unload-module", id])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        eprintln!(
+            "recovered stale {name} (module {id}) left by a previous run{}",
+            if ok { "" } else { " — unload failed" }
+        );
+    }
+}
+
 fn rms(x: &[f32]) -> f32 {
     (x.iter().map(|s| s * s).sum::<f32>() / x.len().max(1) as f32).sqrt()
 }
@@ -654,6 +713,27 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Ctrl-C / SIGTERM funnels into the same shutdown path as `q`, so the
+    // pactl teardown at the end of main always runs (issue #39). In the
+    // TUI, raw mode delivers Ctrl-C as a key event handled in `run_tui`;
+    // this handler covers headless mode and SIGTERM. A second signal
+    // hard-exits in case the graceful path is stuck.
+    let run = Arc::new(AtomicBool::new(true));
+    {
+        let run = run.clone();
+        ctrlc::set_handler(move || {
+            if !run.swap(false, Ordering::Relaxed) {
+                std::process::exit(130);
+            }
+        })
+        .map_err(|e| anyhow::anyhow!("cannot install the signal handler: {e}"))?;
+    }
+
+    // Belt-and-braces: recover devices leaked by a previous run that was
+    // killed before teardown, before creating fresh ones.
+    if !args.no_sink || (args.denoise && args.wav.is_none()) {
+        recover_stale_modules();
+    }
     let mut modules = if args.no_sink {
         Vec::new()
     } else {
@@ -687,7 +767,6 @@ fn main() -> anyhow::Result<()> {
         },
         ..Default::default()
     }));
-    let run = Arc::new(AtomicBool::new(true));
 
     // --- input thread: microphone or paced wav file -> chunk channel.
     // With --engine xvc the wav is preprocessed offline first (exact
@@ -1104,7 +1183,7 @@ fn run_tui(
     sink_ok: bool,
     duration: Option<f32>,
 ) -> anyhow::Result<()> {
-    use crossterm::event::{self, Event, KeyCode};
+    use crossterm::event::{self, Event, KeyCode, KeyModifiers};
     use ratatui::prelude::*;
     use ratatui::widgets::{Block, Borders, Gauge, Paragraph};
 
@@ -1228,6 +1307,9 @@ fn run_tui(
             if let Event::Key(k) = event::read()? {
                 match k.code {
                     KeyCode::Char('q') => break,
+                    // Raw mode turns Ctrl-C into a key event instead of
+                    // SIGINT — treat it as quit so teardown runs (#39).
+                    KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => break,
                     KeyCode::Char('p') => {
                         let mut st = stats.lock().unwrap();
                         st.passthrough = !st.passthrough;
@@ -1275,4 +1357,36 @@ fn run_tui(
     ratatui::restore();
     run.store(false, Ordering::Relaxed);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stale_babiniku_modules;
+
+    /// A realistic `pactl list modules short` listing: the four modules a
+    /// killed demo leaks, plus lookalikes that must be left alone.
+    const LISTING: &str = "\
+5\tmodule-native-protocol-unix\t
+21\tmodule-null-sink\tsink_name=babiniku sink_properties=device.description=Babiniku-Output
+22\tmodule-remap-source\tsource_name=babiniku_mic master=babiniku.monitor source_properties=device.description=Babiniku-Virtual-Mic
+23\tmodule-loopback\tsource=babiniku.monitor latency_msec=60
+24\tmodule-echo-cancel\tsource_name=babiniku_denoised aec_method=webrtc source_properties=device.description=Babiniku-Denoised-Input
+25\tmodule-null-sink\tsink_name=babiniku2
+26\tmodule-null-sink\tsink_name=other sink_properties=device.description=babiniku
+";
+
+    #[test]
+    fn finds_exactly_the_leaked_babiniku_modules() {
+        let stale = stale_babiniku_modules(LISTING);
+        let ids: Vec<&str> = stale.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["21", "22", "23", "24"]);
+        assert_eq!(stale[0].1, "module-null-sink");
+        assert_eq!(stale[2].1, "module-loopback");
+    }
+
+    #[test]
+    fn empty_or_malformed_listings_match_nothing() {
+        assert!(stale_babiniku_modules("").is_empty());
+        assert!(stale_babiniku_modules("garbage without tabs\n\n").is_empty());
+    }
 }
