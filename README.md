@@ -44,7 +44,7 @@ engine and its per-stage RTF.
 |---|---|---|
 | [MeanVC v1](docs/meanvc.md) | ✅ working, official weights | ~0.14 RTF end-to-end on CPU, ≈0.6 s latency; Mandarin-trained ([#28](https://github.com/m96-chan/babiniku.rs/issues/28) tracks Japanese) |
 | [MeanVC 2](docs/meanvc.md) | ⏳ implemented, awaiting official weights | 40 ms chunks → ~110 ms latency class |
-| [X-VC](docs/xvc.md) | ✅ working, official weights — real-time on idle CPU / on GPU | codec-space, **multilingual incl. Japanese**; `--engine xvc` in the demo (240 ms hop, fp32 port of the official stateless driver). Offline RTF 0.69. Streaming via the pipelined 3-stage driver: **late 0 on an idle 8-thread CPU** (bottleneck stage ≈ 0.92 — ⚠️ desktop co-load pushes it past 1.0 and hops go late), **late 0 with RTF ≈ 0.10 on GPU** (`-p vc-demo --features cuda`, RTX 5090); remaining CPU-margin lever is a causal-caching redesign ([#38](https://github.com/m96-chan/babiniku.rs/issues/38)) |
+| [X-VC](docs/xvc.md) | ✅ working, official weights | Japanese-native quality; **live mic needs the CUDA build** (`--features cuda`, CUDA Toolkit at build time only — RTF ≈ 0.10 on GPU; CPU ≈ 0.9+ falls behind on a busy desktop) |
 | [Zero-VC](docs/zero-vc.md) | 🔍 evaluation | zero-lookahead (20 ms algorithmic latency) — latency-first candidate; no public code yet ([#31](https://github.com/m96-chan/babiniku.rs/issues/31)) |
 
 Every engine is ported weight-compatible and verified stage-by-stage against its official implementation with golden tests (`cargo test --workspace`). Deep dive, APIs, checkpoint setup, performance notes: [docs/meanvc.md](docs/meanvc.md). Issues are labeled by architecture (`meanvc`, `meanvc2`, `demo`, `infra`).

@@ -621,6 +621,9 @@ fn run_xvc_conversion(
     // `anchor + k·hop`, anchored on the first emitted hop.
     let mut anchor: Option<Instant> = None;
     let mut emitted: u64 = 0;
+    // Warm-up grace: the first hops absorb one-off costs (cuda kernel
+    // warmup, pipeline fill); underruns there are not steady-state.
+    const WARMUP_HOPS: u64 = 4;
 
     // Forwards every finished hop to the output thread.
     let drain = |stream: &mut xvc::XvcPipelinedStream,
@@ -642,7 +645,9 @@ fn run_xvc_conversion(
                 st.rtf_voc = t.decode.as_secs_f32() / hop;
                 st.out_rms = rms(&step.samples);
                 if now > due + Duration::from_secs_f32(hop) {
-                    st.late += 1;
+                    if *emitted >= WARMUP_HOPS {
+                        st.late += 1;
+                    }
                     // Jitter-buffer semantics: one underrun event counts
                     // once, then the schedule re-anchors to the recovered
                     // timeline. A fixed anchor would flag every subsequent
