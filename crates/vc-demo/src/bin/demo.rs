@@ -478,6 +478,11 @@ fn read_wav_16k(path: &str) -> anyhow::Result<Vec<f32>> {
 struct MicVolumeNormalizer {
     hist: std::collections::VecDeque<f32>,
     gain: f64,
+    /// Gain actually applied to the previous sample; the per-chunk gain
+    /// update is ramped sample-by-sample so chunk boundaries carry no
+    /// level step (a step there reads as a tick once the BWE exciter
+    /// reproduces its broadband splash above 8 kHz).
+    applied: f64,
 }
 
 impl MicVolumeNormalizer {
@@ -488,6 +493,7 @@ impl MicVolumeNormalizer {
         Self {
             hist: std::collections::VecDeque::with_capacity(Self::WINDOW),
             gain: 1.0,
+            applied: 1.0,
         }
     }
 
@@ -511,9 +517,50 @@ impl MicVolumeNormalizer {
             let target = (Self::COEFF / volume).clamp(0.1, 10.0);
             self.gain = 0.8 * self.gain + 0.2 * target;
         }
+        let n = chunk.len().max(1) as f64;
+        let step = (self.gain - self.applied) / n;
         for s in chunk {
-            *s = (*s * self.gain).clamp(-1.0, 1.0);
+            self.applied += step;
+            *s = (*s * self.applied).clamp(-1.0, 1.0);
         }
+    }
+}
+
+#[cfg(test)]
+mod norm_tests {
+    use super::*;
+
+    /// Chunked processing of a steady tone must not introduce level steps
+    /// at chunk boundaries while the gain estimate adapts (issue #42
+    /// field report: ticks during a sustained vowel, live mic only).
+    #[test]
+    fn normalizer_gain_ramps_across_chunks() {
+        let sr = SR as f64;
+        let sig: Vec<f64> = (0..8 * SR)
+            .map(|i| 0.6 * (2.0 * std::f64::consts::PI * 220.0 * i as f64 / sr).sin())
+            .collect();
+        let mut norm = MicVolumeNormalizer::new();
+        let mut out = sig.clone();
+        for c in out.chunks_mut(CHUNK_SAMPLES) {
+            norm.process(c);
+        }
+        // Max adjacent-sample jump of the normalized tone must stay close
+        // to the tone's own slope bound (2*pi*f/sr * amp * max_gain_local),
+        // i.e. no additional boundary steps.
+        let mut max_ratio = 0f64;
+        for w in out.windows(2) {
+            let d = (w[1] - w[0]).abs();
+            max_ratio = max_ratio.max(d);
+        }
+        // Tone slope bound with the converged gain (<= ~0.42 for 220 Hz):
+        // allow 20% headroom; a per-chunk gain step of a few percent on a
+        // 0.6 amplitude tone would exceed this immediately.
+        let slope = 2.0 * std::f64::consts::PI * 220.0 / sr;
+        let bound = out.iter().fold(0f64, |m, &v| m.max(v.abs())) * slope * 1.2 + 1e-6;
+        assert!(
+            max_ratio < bound,
+            "boundary level step detected: {max_ratio} vs slope bound {bound}"
+        );
     }
 }
 
