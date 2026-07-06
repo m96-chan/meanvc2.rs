@@ -56,6 +56,7 @@ Fixtures come in two tiers:
 | | `ckpt/xvc_chain_fixture.safetensors` | one 640 ms streaming chunk forward with every stage intermediate + crossfade slices | ✅ |
 | | `ckpt/xvc_e2e_fixture.safetensors` | out.wav → test.wav end to end: offline + streaming (official 2400/120/100/20 and CPU 640/240/100/20 presets) | ✅ |
 | | `ckpt/xvc_inventory.json` | module path → tensor shape for `xvc.pt` / GLM-4-Voice tokenizer / ERes2Net (porting reference) | ✅ |
+| `convert_xvc_tokenizer.py` | `ckpt/xvc_tokenizer.safetensors` | GLM-4-Voice tokenizer (343.6M) + `semantic_adapter` (29.3M) weights, fp32, official names 1:1 → loaded by `xvc::tokenizer::load` and the `crates/xvc/tests/golden_tokenizer.rs` suite | ✅ |
 
 The X-VC fixtures ([issue #30](https://github.com/m96-chan/babiniku.rs/issues/30)
 Phase 1) need the official [Jerrister/X-VC](https://github.com/Jerrister/X-VC)
