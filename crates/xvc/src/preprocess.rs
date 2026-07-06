@@ -17,6 +17,10 @@
 //!    clamp to `max - 8`, then `(x + 4) / 4`), with the input padded to the
 //!    tokenizer stride (2 · 4 · 160 = 1280 samples) and the matching
 //!    frame-level attention mask.
+//! 3. [`FrameMelExtractor`] — the dB-scale 128-mel spectrogram
+//!    (`mel_extractor.py`, torchaudio `MelSpectrogram` n_fft 1024 /
+//!    win 640 / hop 320 + `AmplitudeToDB`) that conditions the acoustic
+//!    converter (`frame_condition`).
 
 use std::sync::Arc;
 
@@ -90,34 +94,65 @@ pub fn volume_normalize(audio: &[f64], coeff: f64) -> Vec<f64> {
     audio
 }
 
+/// Streaming RBJ high-pass biquad
+/// (`torchaudio.functional.highpass_biquad`, Q = 0.707) with persistent
+/// filter state, so live input can be filtered chunk by chunk with
+/// results identical to the one-shot [`highpass_biquad`].
+#[derive(Debug, Clone)]
+pub struct HighpassBiquad {
+    b0: f64,
+    b1: f64,
+    b2: f64,
+    a1: f64,
+    a2: f64,
+    x1: f64,
+    x2: f64,
+    y1: f64,
+    y2: f64,
+}
+
+impl HighpassBiquad {
+    pub fn new(sample_rate: f64, cutoff_hz: f64) -> Self {
+        const Q: f64 = 0.707;
+        let w0 = 2.0 * std::f64::consts::PI * cutoff_hz / sample_rate;
+        let alpha = w0.sin() / 2.0 / Q;
+        let cos_w0 = w0.cos();
+        let a0 = 1.0 + alpha;
+        Self {
+            b0: (1.0 + cos_w0) / 2.0 / a0,
+            b1: (-1.0 - cos_w0) / a0,
+            b2: (1.0 + cos_w0) / 2.0 / a0,
+            a1: (-2.0 * cos_w0) / a0,
+            a2: (1.0 - alpha) / a0,
+            x1: 0.0,
+            x2: 0.0,
+            y1: 0.0,
+            y2: 0.0,
+        }
+    }
+
+    /// Filters one chunk in place (output clamped to `[-1, 1]` like
+    /// `torchaudio.functional.lfilter(..., clamp=True)`), carrying the
+    /// filter state to the next chunk.
+    pub fn process(&mut self, chunk: &mut [f64]) {
+        for x in chunk {
+            let x0 = *x;
+            let y0 = self.b0 * x0 + self.b1 * self.x1 + self.b2 * self.x2
+                - self.a1 * self.y1
+                - self.a2 * self.y2;
+            (self.x2, self.x1) = (self.x1, x0);
+            (self.y2, self.y1) = (self.y1, y0);
+            *x = y0.clamp(-1.0, 1.0);
+        }
+    }
+}
+
 /// RBJ high-pass biquad (`torchaudio.functional.highpass_biquad`,
 /// Q = 0.707), zero initial conditions, output clamped to `[-1, 1]` like
 /// `torchaudio.functional.lfilter(..., clamp=True)`.
 pub fn highpass_biquad(audio: &[f64], sample_rate: f64, cutoff_hz: f64) -> Vec<f64> {
-    const Q: f64 = 0.707;
-    let w0 = 2.0 * std::f64::consts::PI * cutoff_hz / sample_rate;
-    let alpha = w0.sin() / 2.0 / Q;
-    let cos_w0 = w0.cos();
-
-    let a0 = 1.0 + alpha;
-    let (b0, b1, b2) = (
-        (1.0 + cos_w0) / 2.0 / a0,
-        (-1.0 - cos_w0) / a0,
-        (1.0 + cos_w0) / 2.0 / a0,
-    );
-    let (a1, a2) = ((-2.0 * cos_w0) / a0, (1.0 - alpha) / a0);
-
-    let mut out = Vec::with_capacity(audio.len());
-    let (mut x1, mut x2, mut y1, mut y2) = (0f64, 0f64, 0f64, 0f64);
-    for &x0 in audio {
-        let y0 = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
-        out.push(y0);
-        (x2, x1) = (x1, x0);
-        (y2, y1) = (y1, y0);
-    }
-    for y in &mut out {
-        *y = y.clamp(-1.0, 1.0);
-    }
+    let mut out = audio.to_vec();
+    HighpassBiquad::new(sample_rate, cutoff_hz).process(&mut out);
     out
 }
 
@@ -162,13 +197,21 @@ fn mel_to_hertz(mel: f64) -> f64 {
 }
 
 /// Slaney-normalized triangular mel filterbank,
-/// `[n_mels][n_fft / 2 + 1]` (`transformers.audio_utils.mel_filter_bank`
-/// with `norm="slaney", mel_scale="slaney"`).
-fn slaney_filterbank(n_fft: usize, n_mels: usize, sample_rate: usize, f_max: f64) -> Vec<Vec<f64>> {
+/// `[n_mels][n_fft / 2 + 1]` (`transformers.audio_utils.mel_filter_bank` /
+/// `torchaudio.functional.melscale_fbanks` with
+/// `norm="slaney", mel_scale="slaney"` — identical constructions).
+fn slaney_filterbank(
+    n_fft: usize,
+    n_mels: usize,
+    sample_rate: usize,
+    f_min: f64,
+    f_max: f64,
+) -> Vec<Vec<f64>> {
     let n_bins = n_fft / 2 + 1;
+    let mel_min = hertz_to_mel(f_min);
     let mel_max = hertz_to_mel(f_max);
     let filter_freqs: Vec<f64> = (0..n_mels + 2)
-        .map(|i| mel_to_hertz(mel_max * i as f64 / (n_mels + 1) as f64))
+        .map(|i| mel_to_hertz(mel_min + (mel_max - mel_min) * i as f64 / (n_mels + 1) as f64))
         .collect();
     let fft_freq = |bin: usize| (sample_rate / 2) as f64 * bin as f64 / (n_bins - 1) as f64;
 
@@ -252,7 +295,7 @@ impl WhisperFeatureExtractor {
             n_mels,
             pad_multiple,
             window,
-            filterbank: slaney_filterbank(n_fft, n_mels, sample_rate, 8000.0),
+            filterbank: slaney_filterbank(n_fft, n_mels, sample_rate, 0.0, 8000.0),
             fft: FftPlanner::new().plan_fft_forward(n_fft),
         }
     }
@@ -324,6 +367,141 @@ impl WhisperFeatureExtractor {
     }
 }
 
+/// The frame-level condition mel extractor
+/// (`models/codec/sac/modules/mel_extractor.py::MelExtractor`,
+/// `configs/xvc.yaml` `mel_extractor`): a torchaudio-style 128-bin log-mel
+/// spectrogram in dB — `MelSpectrogram(n_fft=1024, win_length=640,
+/// hop_length=320, f_min=10, power=1, norm/mel_scale="slaney",
+/// center=True/reflect)` + `1e-9` + `AmplitudeToDB(stype="magnitude",
+/// top_db=80)` (20·log₁₀, per-utterance clamp at `max − 80` dB).
+///
+/// This is the mel that conditions the acoustic converter
+/// (`frame_condition = mel_extractor(target_wav_cond)`).
+pub struct FrameMelExtractor {
+    n_fft: usize,
+    hop_length: usize,
+    n_mels: usize,
+    top_db: f64,
+    /// Hann(win_length) centre-padded to `n_fft` like `torch.stft`.
+    window: Vec<f64>,
+    filterbank: Vec<Vec<f64>>,
+    fft: Arc<dyn Fft<f64>>,
+}
+
+impl std::fmt::Debug for FrameMelExtractor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FrameMelExtractor")
+            .field("n_fft", &self.n_fft)
+            .field("hop_length", &self.hop_length)
+            .field("n_mels", &self.n_mels)
+            .finish()
+    }
+}
+
+impl Default for FrameMelExtractor {
+    /// The `configs/xvc.yaml` `mel_extractor`: 128 mels, n_fft 1024,
+    /// win 640, hop 320, f_min 10 Hz, f_max Nyquist, 16 kHz.
+    fn default() -> Self {
+        Self::new(1024, 640, 320, 128, 16_000, 10.0, 80.0)
+    }
+}
+
+impl FrameMelExtractor {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        n_fft: usize,
+        win_length: usize,
+        hop_length: usize,
+        n_mels: usize,
+        sample_rate: usize,
+        f_min: f64,
+        top_db: f64,
+    ) -> Self {
+        // Periodic Hann window of `win_length`, centre-padded to `n_fft`
+        // (`torch.stft` pads the window symmetrically).
+        let mut window = vec![0f64; n_fft];
+        let left = (n_fft - win_length) / 2;
+        for i in 0..win_length {
+            let x = std::f64::consts::PI * i as f64 / win_length as f64;
+            window[left + i] = x.sin().powi(2);
+        }
+        Self {
+            n_fft,
+            hop_length,
+            n_mels,
+            top_db,
+            window,
+            filterbank: slaney_filterbank(
+                n_fft,
+                n_mels,
+                sample_rate,
+                f_min,
+                (sample_rate / 2) as f64,
+            ),
+            fft: FftPlanner::new().plan_fft_forward(n_fft),
+        }
+    }
+
+    /// Mono 16 kHz waveform → `[1, n_mels, samples / hop + 1]` dB-scaled
+    /// log-mel (the centered STFT emits one frame per hop plus one).
+    pub fn extract(&self, samples: &[f32], device: &Device) -> Result<Tensor> {
+        if samples.len() < 2 {
+            return Err(Error::Input("waveform too short for reflect pad".into()));
+        }
+        let n = samples.len();
+        let wav: Vec<f64> = samples.iter().map(|&s| s as f64).collect();
+
+        // Centered STFT, reflect padding of n_fft / 2 on both sides.
+        let half = self.n_fft / 2;
+        let reflect = |i: isize| -> f64 {
+            let n = n as isize;
+            let mut i = i;
+            if i < 0 {
+                i = -i;
+            }
+            if i >= n {
+                i = 2 * (n - 1) - i;
+            }
+            wav[i as usize]
+        };
+        let frames = n / self.hop_length + 1;
+        let n_bins = half + 1;
+        let mut mag = vec![0f64; n_bins * frames]; // [bin][frame]
+        let mut buf = vec![Complex64::default(); self.n_fft];
+        for frame in 0..frames {
+            let start = frame as isize * self.hop_length as isize - half as isize;
+            for (i, b) in buf.iter_mut().enumerate() {
+                *b = Complex64::new(reflect(start + i as isize) * self.window[i], 0.0);
+            }
+            self.fft.process(&mut buf);
+            for (bin, b) in buf[..n_bins].iter().enumerate() {
+                mag[bin * frames + frame] = b.norm();
+            }
+        }
+
+        // Mel projection (+1e-9) → 20·log10 → per-utterance top_db clamp.
+        let mut db = vec![0f64; self.n_mels * frames];
+        let mut max = f64::NEG_INFINITY;
+        for (m, bank) in self.filterbank.iter().enumerate() {
+            for frame in 0..frames {
+                let mut acc = 0f64;
+                for (bin, &w) in bank.iter().enumerate() {
+                    if w != 0.0 {
+                        acc += w * mag[bin * frames + frame];
+                    }
+                }
+                // `mel + eps` then `AmplitudeToDB` (amin 1e-10).
+                let v = 20.0 * (acc + 1e-9).max(1e-10).log10();
+                db[m * frames + frame] = v;
+                max = max.max(v);
+            }
+        }
+        let floor = max - self.top_db;
+        let mel: Vec<f32> = db.into_iter().map(|v| v.max(floor) as f32).collect();
+        Ok(Tensor::from_vec(mel, (1, self.n_mels, frames), device)?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,10 +524,45 @@ mod tests {
     }
 
     #[test]
+    fn streaming_highpass_matches_one_shot() {
+        let audio: Vec<f64> = (0..4000)
+            .map(|i| ((i * 31 % 97) as f64 / 97.0 - 0.5) * 0.4)
+            .collect();
+        let want = highpass_biquad(&audio, 16_000.0, 40.0);
+        let mut hp = HighpassBiquad::new(16_000.0, 40.0);
+        let mut got = Vec::new();
+        for chunk in audio.chunks(333) {
+            let mut c = chunk.to_vec();
+            hp.process(&mut c);
+            got.extend(c);
+        }
+        for (a, b) in got.iter().zip(&want) {
+            assert!((a - b).abs() < 1e-12);
+        }
+    }
+
+    #[test]
     fn highpass_kills_dc() {
         let audio = vec![0.5f64; 4000];
         let out = highpass_biquad(&audio, 16_000.0, 40.0);
         assert!(out.last().unwrap().abs() < 1e-3);
+    }
+
+    #[test]
+    fn frame_mel_shape_and_clamp() {
+        let ex = FrameMelExtractor::default();
+        let samples: Vec<f32> = (0..3200)
+            .map(|i| (2.0 * std::f32::consts::PI * 220.0 * i as f32 / 16_000.0).sin() * 0.3)
+            .collect();
+        let mel = ex.extract(&samples, &Device::Cpu).unwrap();
+        // Centered STFT: samples / hop + 1 frames.
+        assert_eq!(mel.dims(), &[1, 128, 11]);
+        let v: Vec<f32> = mel.flatten_all().unwrap().to_vec1().unwrap();
+        let max = v.iter().fold(f32::NEG_INFINITY, |m, &x| m.max(x));
+        let min = v.iter().fold(f32::INFINITY, |m, &x| m.min(x));
+        assert!(v.iter().all(|x| x.is_finite()));
+        // AmplitudeToDB top_db: dynamic range clamped to 80 dB.
+        assert!(max - min <= 80.0 + 1e-4, "range {} > top_db", max - min);
     }
 
     #[test]

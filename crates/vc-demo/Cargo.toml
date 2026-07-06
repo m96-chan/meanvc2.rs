@@ -14,6 +14,7 @@ path = "src/bin/demo.rs"
 
 [dependencies]
 meanvc = { workspace = true }
+xvc = { workspace = true }
 candle-core = { workspace = true }
 anyhow = { workspace = true }
 num_cpus = { workspace = true }
@@ -29,5 +30,5 @@ nnnoiseless = { version = "0.5", default-features = false }
 default = []
 # Compute the voice print natively from the reference audio (WavLM ONNX).
 wavlm = ["meanvc/wavlm"]
-cuda = ["meanvc/cuda", "candle-core/cuda"]
-metal = ["meanvc/metal", "candle-core/metal"]
+cuda = ["meanvc/cuda", "xvc/cuda", "candle-core/cuda"]
+metal = ["meanvc/metal", "xvc/metal", "candle-core/metal"]

@@ -1,6 +1,6 @@
 [package]
 name = "xvc"
-description = "X-VC engine (zero-shot streaming voice conversion in codec space) — scaffold, see issue #30"
+description = "X-VC engine (zero-shot streaming voice conversion in codec space) — weight-compatible candle port, see issue #30"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

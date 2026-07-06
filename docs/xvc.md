@@ -1,12 +1,14 @@
-# X-VC (engine candidate)
+# X-VC
 
-> **Candidate engine — not yet implemented.** Evaluation notes for **X-VC:
-> Zero-shot Streaming Voice Conversion in Codec Space**
-> ([arXiv:2604.12456](https://arxiv.org/abs/2604.12456), Zheng et al., 2026),
-> under Phase 0 evaluation in [#30](https://github.com/m96-chan/babiniku.rs/issues/30).
+> **Ported and working (quality parity verified); not yet real-time on
+> CPU.** Notes for **X-VC: Zero-shot Streaming Voice Conversion in Codec
+> Space** ([arXiv:2604.12456](https://arxiv.org/abs/2604.12456), Zheng et
+> al., 2026), ported to `crates/xvc` in
+> [#30](https://github.com/m96-chan/babiniku.rs/issues/30) — see
+> [Status](#status) for measured parity and performance.
 
 [![Paper](https://img.shields.io/badge/arXiv-2604.12456-b31b1b.svg)](https://arxiv.org/abs/2604.12456)
-[![Status](https://img.shields.io/badge/status-evaluation-blue.svg)](#status)
+[![Status](https://img.shields.io/badge/status-ported-green.svg)](#status)
 
 X-VC is a zero-shot streaming voice conversion system that performs **one-step
 conversion directly in the latent space of a pretrained neural codec** (SAC),
@@ -27,8 +29,10 @@ the **GLM-4-Voice tokenizer**
 trained bilingually (EN/ZH, ~10k h from Emilia + LibriTTS plus ~20k h of
 Seed-VC-generated pairs) and evaluated **cross-lingually** (EN→ZH WER 2.67 %,
 ZH→EN 2.15 %) — the paper describes the codec-space design as naturally
-supporting cross-lingual conversion. Japanese coverage of the tokenizer is
-unverified: **TBD (Phase 0)**.
+supporting cross-lingual conversion. Japanese coverage of the tokenizer was
+**verified in Phase 0**: offline conversion of Japanese speech preserves the
+transcript exactly (whisper-small ASR) while locking onto the target F0 —
+the Mandarin lock is gone.
 
 ## Key ideas
 
@@ -76,8 +80,9 @@ Streaming behavior is controlled by the official repo's `chunk` / `current` /
 
 - **Model-induced latency 240 ms** = 120 ms current segment + 20 ms overlap +
   100 ms future context; **computation latency 58.17 ms** (encode + convert +
-  decode). Hardware for the compute figure and whether CPU real-time holds:
-  **TBD (Phase 0)**.
+  decode). Measured locally (Phase 0): GPU trivially real-time (RTF 0.18);
+  CPU needs the 640/240 preset and is not yet real-time in the Rust port —
+  see [Status](#status).
 - Offline **RTF 0.014** (vs. Seed-VC tiny 0.069, MeanVC 0.094, same setup).
 - Streaming: SIM 0.62 (EN) / 0.72 (ZH), WER 3.14 % (EN) / 2.65 % (ZH),
   UTMOS 3.07 (EN) / 2.35 (ZH); SMOS 3.98 (EN) / 3.89 (ZH).
@@ -88,27 +93,64 @@ quality collapse is a Phase 0 question.
 
 ## Status
 
-**Phase 0 — evaluation in progress**, tracked in
-[#30](https://github.com/m96-chan/babiniku.rs/issues/30): run the official
-PyTorch implementation, measure Japanese conversion quality and CPU latency,
-and decide go/no-go on a Rust port. Nothing in this repo implements X-VC yet.
+**Ported (Phases 0–1 + demo integration done)**, tracked in
+[#30](https://github.com/m96-chan/babiniku.rs/issues/30). `crates/xvc` is a
+weight-compatible pure-candle port of every inference stage, each verified
+against the official implementation with skip-if-absent golden tests
+(`cargo test -p xvc`):
 
-- [ ] Official pipeline reproduced (offline + streaming)
-- [ ] Japanese source/target quality assessed (tokenizer coverage) — TBD (Phase 0)
-- [ ] CPU real-time feasibility (539 M total params vs. driver-only GPU rule) — TBD (Phase 0)
-- [ ] Streaming-parameter sweep (`current` / `future` vs. quality) — TBD (Phase 0)
+| stage | module | golden parity (max abs vs official CPU fp32) |
+|---|---|---|
+| preprocessing (volume-norm / 40 Hz HP / pad) + Whisper 128-mel | `xvc::preprocess` | wav bit-exact, mel 3.0e-5 |
+| GLM-4-Voice tokenizer (343.6 M) + 12.5→50 Hz semantic adapter | `xvc::tokenizer` | token ids exact, adapter 6.7e-6 |
+| ERes2Net speaker encoder | `xvc::speaker` | embedding 3.2e-5 (cos ≈ 1.0) |
+| SAC codec (DAC encoder / FVQ / decoder) | `xvc::codec` | codes exact, wav 4.0e-6 |
+| prenet fusion (65.3 M, `Decoder_with_upsample`, ratios `[1,1]`) | `xvc::pipeline` | 6.2e-6 |
+| MMDiT acoustic converter (42.4 M) | `xvc::converter` | 4.7e-6 |
+| frame-condition dB-mel (torchaudio `MelSpectrogram` + `AmplitudeToDB`) | `xvc::preprocess::FrameMelExtractor` | 3.4e-4 |
+| **one full streaming window** (chain fixture) | `xvc::pipeline` | wav 1.4e-5 |
+| **offline end to end** (out.wav → test.wav) | `XvcEngine::convert_offline` | 1.2e-5, corr 1.000000 |
+| **full CPU-preset stream** (640/240/100/20) | `XvcStream` | 7.7e-5, corr 1.000000 (no VQ flips) |
 
-## Planned integration
+Usage:
 
-If Phase 0 passes, X-VC follows the house pattern (see
-[docs/meanvc.md](meanvc.md)): a weight-compatible pure-candle port whose module
-tree mirrors the upstream implementation, frozen externals behind the
-`vc-core` (`crates/vc-core/src/encoders.rs`)-style traits (SAC codec, GLM-4-Voice tokenizer, ERes2Net),
-safetensors conversion of the official checkpoints, and stage-by-stage golden
-tests against the official implementation before it is wired into the
-streaming demo. The 539 M-parameter footprint makes CPU viability the gating
-question — quantization or GPU-feature gating may be required, both TBD
-(Phase 0).
+- offline: `cargo run --release -p xvc --example convert_xvc -- <source.wav> <reference.wav> <out.wav>`
+- live: `cargo run --release -p vc-demo --bin meanvc-demo -- --engine xvc --reference her_voice.wav`
+- weights: convert the official checkpoints once with
+  `tools/convert_xvc_tokenizer.py`, `tools/convert_xvc_speaker.py`,
+  `tools/convert_xvc_generator.py` →
+  `ckpt/xvc_{tokenizer,speaker,codec,converter,prenet}.safetensors`
+  (~2.1 GiB fp32 total).
+
+**Performance (CPU, 8 threads, fp32)** — the honest caveat:
+
+| mode | measured | budget |
+|---|---|---|
+| offline | RTF **0.69** | — |
+| streaming 640/240/100/20 | ≈ 425 ms/hop → RTF **≈ 1.75** (semantic 0.50 / convert 0.66 / decode 0.61) | 240 ms |
+
+The official PyTorch driver reaches RTF 0.72 on the same box, so the gap is
+per-op speed (candle conv/attention fp32), not the driver. **Streaming is
+not yet real-time on CPU**; the demo runs but falls behind (every hop
+late). Phase-2 levers, in order: q8 quantization of the Whisper encoder +
+codec decoder (~60 % of compute), incremental caching (causal convs +
+block-causal attention make the tokenizer cacheable; the DAC encoder is
+fully convolutional), stage pipelining across threads. On GPU the official
+preset is trivially real-time (recon: RTF 0.18).
+
+- [x] Official pipeline reproduced (offline + streaming)
+- [x] Japanese source/target quality assessed — **PASS** (identical ASR
+      transcript offline, target F0 locked in all pairs incl. cross-gender)
+- [x] CPU real-time feasibility — offline yes (0.69), streaming not yet
+      (≈ 1.75 @ 8 threads); Phase-2 optimization tracked in #30
+- [x] Streaming-parameter sweep — 640 ms window / 240 ms hop chosen as the
+      CPU preset (quality holds; official 2400/120 preset available via
+      `StreamConfig::official()`)
+
+Listening references in `ckpt/` (gitignored): `xvc_rust_ja_out_to_test_offline.wav`
+(ja → test.wav), `xvc_rust_M06_to_out_offline.wav` (babiniku direction:
+male JVS M06 → out.wav voice), `xvc_demo_out.wav` (live-demo streaming
+output), plus the Phase-0 official outputs `xvc_ja_*.wav` for A/B.
 
 ## Citation
 

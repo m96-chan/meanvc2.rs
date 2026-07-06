@@ -8,6 +8,7 @@ weights from https://huggingface.co/chenxie95/X-VC) to safetensors
 |-------------------------------|---------------------------------------------------|
 | `ckpt/xvc_codec.safetensors`      | `acoustic_encoder.*`, `acoustic_quantizer.*`, `acoustic_decoder.*` (the SAC acoustic codec) |
 | `ckpt/xvc_converter.safetensors`  | `acoustic_converter.*` (the 6-block MMDiT converter) |
+| `ckpt/xvc_prenet.safetensors`     | `prenet.*` (the semantic+acoustic fusion `Decoder_with_upsample`, plain LayerNorm — no weight_norm to fold) |
 
 Weight-norm folding: the checkpoint stores every `WNConv1d` /
 `WNConvTranspose1d` weight as a `torch.nn.utils.parametrizations.weight_norm`
@@ -35,6 +36,7 @@ from safetensors.torch import save_file
 
 CODEC_PREFIXES = ("acoustic_encoder.", "acoustic_quantizer.", "acoustic_decoder.")
 CONVERTER_PREFIXES = ("acoustic_converter.",)
+PRENET_PREFIXES = ("prenet.",)
 DROP_KEYS = {"acoustic_quantizer.cluster_size"}
 
 WN_G_SUFFIX = ".parametrizations.weight.original0"
@@ -85,6 +87,7 @@ def main():
 
     export(sd, CODEC_PREFIXES, args.ckpt / "xvc_codec.safetensors")
     export(sd, CONVERTER_PREFIXES, args.ckpt / "xvc_converter.safetensors")
+    export(sd, PRENET_PREFIXES, args.ckpt / "xvc_prenet.safetensors")
 
 
 if __name__ == "__main__":

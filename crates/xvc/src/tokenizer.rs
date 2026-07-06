@@ -505,43 +505,54 @@ impl VocosBackbone {
 /// With no downsampler the official skip wiring degenerates to
 /// `(upmerge + repeat) + upmerge` where `upmerge = repeat + deconv`
 /// (i.e. 3·repeat + 2·deconv). `[batch, time, dim]` → `[batch, dim, scale·time]`.
+///
+/// With `scale == 1` (the prenet's `sample_ratios = [1, 1]`) the official
+/// block has no upsampler at all and every skip is the identity, so it
+/// degenerates to a transpose plus `3·x`.
 #[derive(Debug)]
 struct SamplingBlock {
-    de_conv_upsampler: ConvTranspose1d,
+    de_conv_upsampler: Option<ConvTranspose1d>,
     scale: usize,
 }
 
 impl SamplingBlock {
     fn new(dim: usize, scale: usize, vb: VarBuilder) -> candle_core::Result<Self> {
-        let cfg = ConvTranspose1dConfig {
-            padding: scale / 2 + scale % 2,
-            output_padding: scale % 2,
-            stride: scale,
-            dilation: 1,
-            groups: dim,
-        };
-        Ok(Self {
-            de_conv_upsampler: conv_transpose1d(
+        let de_conv_upsampler = if scale > 1 {
+            let cfg = ConvTranspose1dConfig {
+                padding: scale / 2 + scale % 2,
+                output_padding: scale % 2,
+                stride: scale,
+                dilation: 1,
+                groups: dim,
+            };
+            Some(conv_transpose1d(
                 dim,
                 dim,
                 scale * 2,
                 cfg,
                 vb.pp("de_conv_upsampler.1"),
-            )?,
+            )?)
+        } else {
+            None
+        };
+        Ok(Self {
+            de_conv_upsampler,
             scale,
         })
     }
 
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let x = x.transpose(1, 2)?.contiguous()?; // [B, C, T]
+        let Some(de_conv_upsampler) = &self.de_conv_upsampler else {
+            // scale == 1: conv_res = skip1 = skip2 = x.
+            return x * 3.0;
+        };
         let (b, c, t) = x.dims3()?;
         let repeat =
             x.unsqueeze(3)?
                 .expand((b, c, t, self.scale))?
                 .reshape((b, c, t * self.scale))?;
-        let deconv = self
-            .de_conv_upsampler
-            .forward(&candle_nn::ops::leaky_relu(&x, 0.2)?)?;
+        let deconv = de_conv_upsampler.forward(&candle_nn::ops::leaky_relu(&x, 0.2)?)?;
         // Official skip sum, in evaluation order: conv_res + skip1 + skip2
         // with conv_res = skip2 = upmerge (= repeat + deconv), skip1 = repeat.
         let upmerge = (&repeat + deconv)?;
@@ -707,6 +718,49 @@ mod tests {
             .to_vec1::<f32>()
             .unwrap();
         assert!(mask[4 * 6 + 5] == f32::MIN, "padded key masked");
+    }
+
+    #[test]
+    fn sampling_block_scale_one_is_triple_identity() {
+        let dev = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &dev);
+        let block = SamplingBlock::new(4, 1, vb).unwrap();
+        let x = Tensor::randn(0f32, 1f32, (1, 5, 4), &dev).unwrap();
+        let y = block.forward(&x).unwrap(); // [B, C, T]
+        let expect = (x.transpose(1, 2).unwrap() * 3.0).unwrap();
+        let diff = (y - expect)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            diff < 1e-6,
+            "scale-1 SamplingBlock must be 3·x, diff {diff}"
+        );
+    }
+
+    #[test]
+    fn adapter_with_unit_ratios_preserves_time() {
+        // The prenet configuration: `sample_ratios = [1, 1]`.
+        let dev = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &dev);
+        let cfg = SemanticAdapterConfig {
+            input_channels: 24,
+            vocos_dim: 8,
+            vocos_intermediate_dim: 16,
+            vocos_num_layers: 2,
+            out_channels: 12,
+            sample_ratios: vec![1, 1],
+        };
+        let prenet = SemanticAdapter::new(cfg, vb).unwrap();
+        let x = Tensor::randn(0f32, 1f32, (1, 24, 5), &dev).unwrap();
+        let y = prenet.forward(&x).unwrap();
+        assert_eq!(y.dims(), &[1, 12, 5]);
     }
 
     #[test]
