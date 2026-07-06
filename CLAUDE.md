@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Guidance for AI assistants (and humans) working in the **meanvc2.rs** repository.
+Guidance for AI assistants (and humans) working in the **babiniku.rs** repository (formerly meanvc2.rs).
 
 > **Read [`README.md`](README.md) and the relevant issue first — every task
 > starts there (rules 4 & 6).** Deviations from the paper and the remaining
@@ -8,7 +8,7 @@ Guidance for AI assistants (and humans) working in the **meanvc2.rs** repository
 
 ## Project summary
 
-meanvc2.rs is an unofficial Rust implementation of **MeanVC 2: Robust
+babiniku.rs is a real-time voice-conversion toolkit; its first engine is an unofficial Rust implementation of **MeanVC 2: Robust
 Low-Latency Streaming Zero-Shot Voice Conversion**
 ([arXiv:2606.09050](https://arxiv.org/abs/2606.09050)).
 
