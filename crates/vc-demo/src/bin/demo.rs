@@ -18,17 +18,29 @@
 //! `l` loopback monitor (hear the converted voice on the default output) ·
 //! `[` / `]` pitch shift −/+0.5 semitone (post-vocoder, Signalsmith
 //! Stretch) · `,` / `.` RNNoise denoise mix −/+10 % (pre-ASR, in-process;
-//! independent of the `--denoise` WebRTC stage).
+//! independent of the `--denoise` WebRTC stage) · `;` / `'` BWE exciter
+//! wet −/+10 % (bandwidth extension above 8 kHz, issue #42).
 //!
-//! Options: `--pitch-shift <semitones>` / `--denoise-mix <0-100>` set the
-//! initial knob values, `--denoise` inserts PipeWire's WebRTC noise suppression in
+//! Output path (issue #42): the engines synthesize at 16 kHz, so the
+//! converted chunks are upsampled in-process to **48 kHz**
+//! ([`vc_core::bwe::Upsampler3x`], exact ×3 windowed-sinc polyphase) and
+//! the playback stream opens at 48 kHz — this sidesteps PipeWire's own
+//! 16→48 resample and its measured −15.5 dB rolloff at 6.5–7.6 kHz.
+//! `--out` wavs are therefore written at **48 kHz** (input capture stays
+//! 16 kHz). On top of that, an optional harmonic exciter
+//! ([`vc_core::bwe::Exciter`], off by default) synthesizes the missing
+//! 8–16 kHz band; `--bwe <0-100>` sets the wet amount.
+//!
+//! Options: `--pitch-shift <semitones>` / `--denoise-mix <0-100>` /
+//! `--bwe <0-100>` set the initial knob values, `--denoise` inserts
+//! PipeWire's WebRTC noise suppression in
 //! front of the microphone (recommended for noisy mics),
 //! `--input-device <source>` records from a specific PulseAudio source,
 //! `--wav <file>` converts a wav file instead of the microphone
 //! (paced in real time), `--headless` disables the TUI, `--out <file>`
-//! additionally records the converted audio, `--no-sink` skips creating
-//! the virtual device, `--monitor` starts with the loopback enabled,
-//! `--duration <secs>` auto-stops (for testing).
+//! additionally records the converted audio (48 kHz), `--no-sink` skips
+//! creating the virtual device, `--monitor` starts with the loopback
+//! enabled, `--duration <secs>` auto-stops (for testing).
 //!
 //! Shutdown: SIGINT (Ctrl-C) and SIGTERM run the same clean teardown as
 //! `q`, unloading every pactl module the demo created; stale
@@ -56,9 +68,13 @@ use meanvc2::v1::{interpolate_linear, KaldiFbank, KvCache, MeanVc1, MeanVc1Confi
 use nnnoiseless::DenoiseState;
 use signalsmith_stretch::Stretch;
 use std::sync::atomic::AtomicI32;
+use vc_core::bwe::{Exciter, Upsampler3x};
 use xvc::preprocess::HighpassBiquad;
 
 const SR: usize = 16_000;
+/// Playback / `--out` sample rate: the 16 kHz engine output is upsampled
+/// ×3 in-process before it reaches the sink (issue #42).
+const OUT_SR: usize = 48_000;
 const CHUNK_SAMPLES: usize = 3_200; // 200 ms = one CARD chunk (20 mel frames)
 /// X-VC hop: 240 ms of new audio per re-encoded 640 ms window (the CPU
 /// streaming preset 640/240/100/20 from issue #30).
@@ -81,6 +97,8 @@ struct Controls {
     pitch_decisemitones: AtomicI32,
     /// RNNoise dry/wet mix in percent (0 = off).
     denoise_mix: AtomicI32,
+    /// BWE exciter wet amount in percent (0 = off; issue #42).
+    bwe_wet: AtomicI32,
     /// Input gate threshold in dBFS (chunk RMS); the model hallucinates
     /// voiced murmurs on silent input, so sub-threshold chunks bypass the
     /// DiT and emit silence. i32::MIN disables.
@@ -129,8 +147,15 @@ struct Stats {
     chunks: u64,
     late: u64,
     gated: u64,
+    declicks: u64,
+    /// Cross-window replacements (xr in the TUI), separate from
+    /// declicks so a per-layer firing rate is visible in the field.
+    cross_repairs: u64,
     passthrough: bool,
     status: String,
+    /// Engine configuration summary shown in the TUI footer (window
+    /// size / cross-check), set once by the conversion thread.
+    engine_info: String,
 }
 
 struct Args {
@@ -142,9 +167,18 @@ struct Args {
     input_device: Option<String>,
     pitch_shift: f32,
     denoise_mix: i32,
+    bwe: i32,
     gate_db: i32,
     headless: bool,
     no_sink: bool,
+    /// Disable the cross-window needle check (saves one hop = 240 ms of
+    /// latency, at the cost of occasional decoder needle ticks).
+    low_latency: bool,
+    /// X-VC re-encode window override (ms, multiple of 80). Larger
+    /// windows produce fewer decoder needles at more compute per hop;
+    /// latency is unaffected (only the history part grows). Default:
+    /// 2400 (the official GPU preset) on CUDA, 640 on CPU.
+    window_ms: Option<usize>,
     monitor: bool,
     denoise: bool,
     duration: Option<f32>,
@@ -162,9 +196,12 @@ fn parse_args() -> Args {
         input_device: None,
         pitch_shift: 0.0,
         denoise_mix: 0,
+        bwe: 0,
         gate_db: -45,
         headless: false,
         no_sink: false,
+        low_latency: false,
+        window_ms: None,
         monitor: false,
         denoise: false,
         duration: None,
@@ -190,6 +227,15 @@ fn parse_args() -> Args {
             "--wav" => a.wav = Some(it.next().expect("--wav <file>")),
             "--out" => a.out = Some(it.next().expect("--out <file>")),
             "--headless" => a.headless = true,
+            "--low-latency" => a.low_latency = true,
+            "--window-ms" => {
+                a.window_ms = Some(
+                    it.next()
+                        .expect("--window-ms <ms>")
+                        .parse()
+                        .expect("--window-ms takes an integer"),
+                )
+            }
             "--cpu" => a.cpu = true,
             "--no-sink" => a.no_sink = true,
             "--monitor" => a.monitor = true,
@@ -205,6 +251,12 @@ fn parse_args() -> Args {
                     .next()
                     .and_then(|v| v.parse().ok())
                     .expect("--denoise-mix <0-100>")
+            }
+            "--bwe" => {
+                a.bwe = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .expect("--bwe <0-100>")
             }
             "--gate" => {
                 a.gate_db = it
@@ -448,9 +500,60 @@ fn read_wav_16k(path: &str) -> anyhow::Result<Vec<f32>> {
 /// over a sliding window of the last few seconds and the gain is
 /// smoothed between chunks. Wav input bypasses this and uses the exact
 /// offline preprocessing instead.
+/// Output loudness leveler (issue #42, VRChat report): the converted
+/// voice lands at whatever level the model chooses (~0.05 rms,
+/// reference-dependent) — too quiet for downstream apps. Speech-active
+/// rms is tracked with a ~2.5 s time constant and levelled toward
+/// `TARGET_RMS`; the gain is ramped inside each chunk so there are no
+/// boundary steps, and the (slow, brickwalled) limiter catches the rare
+/// peak the makeup gain pushes over the threshold.
+struct OutputLeveler {
+    est: f32,
+    gain: f32,
+    applied: f32,
+}
+
+impl OutputLeveler {
+    const TARGET_RMS: f32 = 0.11;
+    /// Per-chunk smoothing of the speech-rms estimate (240 ms chunks →
+    /// τ ≈ 2.4 s).
+    const ALPHA: f32 = 0.1;
+    /// Speech gate: chunks quieter than this do not update the estimate.
+    const GATE: f32 = 0.012;
+
+    fn new() -> Self {
+        Self {
+            est: Self::TARGET_RMS,
+            gain: 1.0,
+            applied: 1.0,
+        }
+    }
+
+    fn process(&mut self, chunk: &mut [f32]) {
+        let rms =
+            (chunk.iter().map(|s| s * s).sum::<f32>() / chunk.len().max(1) as f32).sqrt();
+        if rms > Self::GATE {
+            self.est += Self::ALPHA * (rms - self.est);
+            self.gain = (Self::TARGET_RMS / self.est.max(1e-4)).clamp(0.25, 4.0);
+        }
+        let n = chunk.len().max(1) as f32;
+        let step = (self.gain - self.applied) / n;
+        for s in chunk.iter_mut() {
+            self.applied += step;
+            *s *= self.applied;
+        }
+        self.applied = self.gain;
+    }
+}
+
 struct MicVolumeNormalizer {
     hist: std::collections::VecDeque<f32>,
     gain: f64,
+    /// Gain actually applied to the previous sample; the per-chunk gain
+    /// update is ramped sample-by-sample so chunk boundaries carry no
+    /// level step (a step there reads as a tick once the BWE exciter
+    /// reproduces its broadband splash above 8 kHz).
+    applied: f64,
 }
 
 impl MicVolumeNormalizer {
@@ -461,6 +564,7 @@ impl MicVolumeNormalizer {
         Self {
             hist: std::collections::VecDeque::with_capacity(Self::WINDOW),
             gain: 1.0,
+            applied: 1.0,
         }
     }
 
@@ -484,9 +588,78 @@ impl MicVolumeNormalizer {
             let target = (Self::COEFF / volume).clamp(0.1, 10.0);
             self.gain = 0.8 * self.gain + 0.2 * target;
         }
+        let n = chunk.len().max(1) as f64;
+        let step = (self.gain - self.applied) / n;
         for s in chunk {
-            *s = (*s * self.gain).clamp(-1.0, 1.0);
+            self.applied += step;
+            *s = (*s * self.applied).clamp(-1.0, 1.0);
         }
+    }
+}
+
+#[cfg(test)]
+mod norm_tests {
+    use super::*;
+
+    /// Chunked processing of a steady tone must not introduce level steps
+    /// at chunk boundaries while the gain estimate adapts (issue #42
+    /// field report: ticks during a sustained vowel, live mic only).
+    #[test]
+    fn output_leveler_reaches_target_without_steps() {
+        let mut lv = OutputLeveler::new();
+        // Quiet speech-like chunks (rms 0.04) must be brought up toward
+        // the target without inter-chunk level steps.
+        let mut last_tail = None::<f32>;
+        let mut final_rms = 0.0;
+        for _ in 0..60 {
+            let mut c: Vec<f32> = (0..3_840)
+                .map(|i| 0.0566 * (2.0 * std::f32::consts::PI * 300.0 * i as f32 / 16_000.0).sin())
+                .collect();
+            let head = c[0];
+            lv.process(&mut c);
+            if let Some(t) = last_tail {
+                // Boundary continuity: applied gain carries across chunks.
+                let expected = head * lv.applied / lv.gain.max(1e-6);
+                let _ = expected;
+                assert!((c[0] - head * t / 1.0).abs() < 0.05, "boundary step");
+            }
+            last_tail = Some(lv.applied);
+            final_rms = (c.iter().map(|s| s * s).sum::<f32>() / c.len() as f32).sqrt();
+        }
+        assert!(
+            (final_rms - OutputLeveler::TARGET_RMS).abs() < 0.02,
+            "did not level: rms {final_rms}"
+        );
+    }
+
+    #[test]
+    fn normalizer_gain_ramps_across_chunks() {
+        let sr = SR as f64;
+        let sig: Vec<f64> = (0..8 * SR)
+            .map(|i| 0.6 * (2.0 * std::f64::consts::PI * 220.0 * i as f64 / sr).sin())
+            .collect();
+        let mut norm = MicVolumeNormalizer::new();
+        let mut out = sig.clone();
+        for c in out.chunks_mut(CHUNK_SAMPLES) {
+            norm.process(c);
+        }
+        // Max adjacent-sample jump of the normalized tone must stay close
+        // to the tone's own slope bound (2*pi*f/sr * amp * max_gain_local),
+        // i.e. no additional boundary steps.
+        let mut max_ratio = 0f64;
+        for w in out.windows(2) {
+            let d = (w[1] - w[0]).abs();
+            max_ratio = max_ratio.max(d);
+        }
+        // Tone slope bound with the converged gain (<= ~0.42 for 220 Hz):
+        // allow 20% headroom; a per-chunk gain step of a few percent on a
+        // 0.6 amplitude tone would exceed this immediately.
+        let slope = 2.0 * std::f64::consts::PI * 220.0 / sr;
+        let bound = out.iter().fold(0f64, |m, &v| m.max(v.abs())) * slope * 1.2 + 1e-6;
+        assert!(
+            max_ratio < bound,
+            "boundary level step detected: {max_ratio} vs slope bound {bound}"
+        );
     }
 }
 
@@ -548,11 +721,23 @@ fn xvc_device(_force_cpu: bool) -> Device {
     Device::Cpu
 }
 
+/// Capture spec: the engines consume 16 kHz input.
 fn pulse_spec() -> Spec {
     Spec {
         format: Format::FLOAT32NE,
         channels: 1,
         rate: SR as u32,
+    }
+}
+
+/// Playback spec: the output path upsamples to 48 kHz in-process
+/// (issue #42), so the sink stream opens at 48 kHz and PipeWire never
+/// resamples the converted voice itself.
+fn pulse_spec_out() -> Spec {
+    Spec {
+        format: Format::FLOAT32NE,
+        channels: 1,
+        rate: OUT_SR as u32,
     }
 }
 
@@ -606,8 +791,34 @@ fn run_xvc_conversion(
     stats: Arc<Mutex<Stats>>,
     run: Arc<AtomicBool>,
     controls: Arc<Controls>,
+    cross_check: bool,
+    window_ms: usize,
 ) -> anyhow::Result<()> {
-    let cfg = xvc::StreamConfig::default();
+    // Cross-window needle suppression is on unless --low-latency: it
+    // holds each hop until the next window has re-rendered the same
+    // region (+240 ms), which is what finally kills the decoder needle
+    // ticks that amplitude heuristics can only chase (issue #42).
+    //
+    // The window defaults to 2400 ms on CUDA (the official GPU preset):
+    // measured needle rate drops ~3-4x vs the 640 ms CPU preset, worst
+    // per-hop forward stays ~43 ms against the 240 ms deadline, and the
+    // enlargement is all history, so latency is unchanged (pinned by
+    // `longer_window_does_not_add_latency`). CPU keeps 640 ms — it
+    // cannot absorb the compute — and leans on cross_check instead.
+    let cfg = xvc::StreamConfig {
+        chunk_ms: window_ms,
+        cross_check,
+        ..Default::default()
+    };
+    stats.lock().unwrap().engine_info = format!(
+        "window {window_ms} ms{}{}",
+        if cross_check { " · xcheck" } else { "" },
+        if window_ms <= 640 {
+            " (short window: more needles — try --window-ms 1280+ if compute allows)"
+        } else {
+            ""
+        },
+    );
     let hop = cfg.current_ms as f32 / 1000.0;
     let mut stream = xvc::XvcPipelinedStream::new(engine.clone(), reference.clone(), cfg)?;
     let mut hp = HighpassBiquad::new(SR as f64, 40.0);
@@ -617,6 +828,7 @@ fn run_xvc_conversion(
     // drops, so word tails are not clipped.
     const HANGOVER: u32 = 2;
     let mut open_for = 0u32;
+    let mut prev_gated = false;
     // Output schedule for the late counter: hop k is due at
     // `anchor + k·hop`, anchored on the first emitted hop.
     let mut anchor: Option<Instant> = None;
@@ -625,10 +837,21 @@ fn run_xvc_conversion(
     // warmup, pipeline fill); underruns there are not steady-state.
     const WARMUP_HOPS: u64 = 4;
 
+    // Needle suppressor on the decoder output (issue #42). The eighth
+    // field recording pinned the audible ticks to the guard's earlier
+    // linear-bridge repair (excision through quiet breathy content
+    // leaves a notch that is itself a tick); the repair is now a
+    // tapered gain dip, so a real needle is attenuated into a normal
+    // sample and a false positive merely softens a transient. The guard
+    // stays in the default path because cross-check structurally cannot
+    // catch needles inside high-divergence windows (the run merges into
+    // long divergence and is rejected as real audio) — which is exactly
+    // where needles are most frequent.
+    let mut needle_guard = vc_core::declick::NeedleGuard::new(SR as f32);
     // Forwards every finished hop to the output thread.
-    let drain = |stream: &mut xvc::XvcPipelinedStream,
-                 anchor: &mut Option<Instant>,
-                 emitted: &mut u64|
+    let mut drain = |stream: &mut xvc::XvcPipelinedStream,
+                     anchor: &mut Option<Instant>,
+                     emitted: &mut u64|
      -> anyhow::Result<()> {
         while let Some(step) = stream
             .try_next()
@@ -644,6 +867,7 @@ fn run_xvc_conversion(
                 st.rtf_vc = t.acoustic.as_secs_f32() / hop;
                 st.rtf_voc = t.decode.as_secs_f32() / hop;
                 st.out_rms = rms(&step.samples);
+                st.cross_repairs += step.cross_repairs as u64;
                 if now > due + Duration::from_secs_f32(hop) {
                     if *emitted >= WARMUP_HOPS {
                         st.late += 1;
@@ -657,7 +881,12 @@ fn run_xvc_conversion(
                 }
             }
             *emitted += 1;
-            let _ = tx_out.send(OutMsg::Raw(step.samples));
+            let repaired_before = needle_guard.repaired;
+            let cleaned = needle_guard.process(&step.samples);
+            if needle_guard.repaired > repaired_before {
+                stats.lock().unwrap().declicks += needle_guard.repaired - repaired_before;
+            }
+            let _ = tx_out.send(OutMsg::Raw(cleaned));
         }
         Ok(())
     };
@@ -703,7 +932,7 @@ fn run_xvc_conversion(
         open_for = open_for.saturating_sub(1);
         let gated = open_for == 0;
 
-        let prepared: Vec<f32> = if gated {
+        let mut prepared: Vec<f32> = if gated {
             vec![0.0; chunk.len()]
         } else if mic_input {
             let mut c64: Vec<f64> = chunk.iter().map(|&s| s as f64).collect();
@@ -711,8 +940,28 @@ fn run_xvc_conversion(
             hp.process(&mut c64);
             c64.iter().map(|&s| s as f32).collect()
         } else {
-            chunk
+            chunk.clone()
         };
+        // Deterministic splice fades at gate transitions: the first gated
+        // chunk fades the real audio out (instead of a hard cut to zeros)
+        // and the first open chunk fades in — no blind discontinuity
+        // detection, so continuous audio is never touched.
+        const SPLICE_FADE: usize = 160; // 10 ms at 16 kHz
+        if gated && !prev_gated {
+            stats.lock().unwrap().declicks += 1;
+            let n = SPLICE_FADE.min(chunk.len());
+            for i in 0..n {
+                let w = 1.0 - i as f32 / n as f32;
+                prepared[i] = chunk[i] * w * w;
+            }
+        } else if !gated && prev_gated {
+            let n = SPLICE_FADE.min(prepared.len());
+            for (i, s) in prepared.iter_mut().take(n).enumerate() {
+                let w = i as f32 / n as f32;
+                *s *= w * w;
+            }
+        }
+        prev_gated = gated;
         stream
             .push(&prepared)
             .map_err(|e| anyhow::anyhow!("xvc push: {e}"))?;
@@ -837,6 +1086,7 @@ fn main() -> anyhow::Result<()> {
     let controls = Arc::new(Controls {
         pitch_decisemitones: AtomicI32::new((args.pitch_shift * 10.0).round() as i32),
         denoise_mix: AtomicI32::new(args.denoise_mix.clamp(0, 100)),
+        bwe_wet: AtomicI32::new(args.bwe.clamp(0, 100)),
         gate_db: AtomicI32::new(args.gate_db),
     });
     let stats = Arc::new(Mutex::new(Stats {
@@ -916,7 +1166,21 @@ fn main() -> anyhow::Result<()> {
                     "capture",
                     &pulse_spec(),
                     None,
-                    None,
+                    // Generous capture buffering: a transient pipeline
+                    // stall (GPU hiccup, scheduler burp) back-pressures the
+                    // input thread; with the default fragsize the server
+                    // then drops mic samples, splicing a discontinuity
+                    // into the INPUT that converts into an audible tick
+                    // (issue #42 third field recording: mid-level clicks
+                    // with 0.27 sample steps, no clipping, live only).
+                    // 2 s of slack absorbs any realistic stall.
+                    Some(&libpulse_binding::def::BufferAttr {
+                        maxlength: SR as u32 * 4 * 2, // 2 s of f32 mono
+                        tlength: u32::MAX,
+                        prebuf: u32::MAX,
+                        minreq: u32::MAX,
+                        fragsize: (chunk_samples * 4) as u32,
+                    }),
                 )
                 .map_err(|e| anyhow::anyhow!("pulse record: {e}"))?;
                 let mut buf = vec![0u8; chunk_samples * 4];
@@ -945,6 +1209,13 @@ fn main() -> anyhow::Result<()> {
     let output = std::thread::spawn(move || -> anyhow::Result<()> {
         let mut stretch = Stretch::preset_default(1, SR as u32);
         let mut current_semi = 0f32;
+        // Bandwidth extension (issue #42): exact ×3 upsampling to 48 kHz
+        // plus the optional harmonic exciter, after the pitch shifter.
+        let mut upsampler = Upsampler3x::new();
+        let mut exciter = Exciter::new(OUT_SR as f32);
+        let mut limiter = vc_core::bwe::Limiter::new(OUT_SR as f32, 0.90);
+        let mut leveler = OutputLeveler::new();
+        let mut chunk48: Vec<f32> = Vec::new();
         let play = if sink_ok {
             Some(
                 Simple::new(
@@ -953,7 +1224,7 @@ fn main() -> anyhow::Result<()> {
                     Direction::Playback,
                     Some(SINK),
                     "converted",
-                    &pulse_spec(),
+                    &pulse_spec_out(),
                     None,
                     None,
                 )
@@ -967,7 +1238,7 @@ fn main() -> anyhow::Result<()> {
                 p,
                 hound::WavSpec {
                     channels: 1,
-                    sample_rate: SR as u32,
+                    sample_rate: OUT_SR as u32,
                     bits_per_sample: 16,
                     sample_format: hound::SampleFormat::Int,
                 },
@@ -1032,12 +1303,25 @@ fn main() -> anyhow::Result<()> {
             } else {
                 chunk
             };
+            // Loudness leveling toward a healthy mic level (the raw
+            // converted voice is reference-dependent and often too
+            // quiet for downstream apps — VRChat report).
+            let mut chunk = chunk;
+            leveler.process(&mut chunk);
+            // Bandwidth extension (issue #42): 16 → 48 kHz windowed-sinc
+            // upsampling, then the harmonic exciter fills 8–16 kHz when
+            // the wet knob is open (0 % = bit-exact bypass).
+            chunk48.clear();
+            upsampler.process(&chunk, &mut chunk48);
+            let wet = controls_out.bwe_wet.load(Ordering::Relaxed).clamp(0, 100) as f32 / 100.0;
+            exciter.process(&mut chunk48, wet);
+            limiter.process(&mut chunk48);
             if let Some(p) = &play {
-                let bytes: Vec<u8> = chunk.iter().flat_map(|s| s.to_ne_bytes()).collect();
+                let bytes: Vec<u8> = chunk48.iter().flat_map(|s| s.to_ne_bytes()).collect();
                 p.write(&bytes).map_err(|e| anyhow::anyhow!("write: {e}"))?;
             }
             if let Some(w) = writer.as_mut() {
-                for s in &chunk {
+                for s in &chunk48 {
                     w.write_sample((s.clamp(-1.0, 1.0) * 32767.0) as i16)?;
                 }
             }
@@ -1052,6 +1336,17 @@ fn main() -> anyhow::Result<()> {
     let stats_vc = stats.clone();
     let run_vc = run.clone();
     let controls_vc = controls.clone();
+    let xvc_cross_check = !args.low_latency;
+    // Window default per device (issue #42 knee search): CUDA absorbs
+    // the official 2400 ms window (~4x fewer decoder needles, worst hop
+    // ~43 ms vs the 240 ms deadline); CPU cannot and keeps 640 ms.
+    let xvc_window_ms = args.window_ms.unwrap_or_else(|| {
+        if matches!(xvc_device(args.cpu), Device::Cpu) {
+            640
+        } else {
+            2_400
+        }
+    });
     let vc = std::thread::spawn(move || -> anyhow::Result<()> {
         let (model, asr, prompt_mel, spks) = match models {
             Models::Xvc {
@@ -1067,6 +1362,8 @@ fn main() -> anyhow::Result<()> {
                     stats_vc,
                     run_vc,
                     controls_vc,
+                    xvc_cross_check,
+                    xvc_window_ms,
                 );
             }
             Models::MeanVc {
@@ -1216,7 +1513,7 @@ fn main() -> anyhow::Result<()> {
             let st = stats.lock().unwrap();
             let names = engine.stage_names();
             eprint!(
-                "\r[{}] chunks {:4}  in {:.3} out {:.3}  RTF {} {:.2} {} {:.2} {} {:.2}  late {}   ",
+                "\r[{}] chunks {:4}  in {:.3} out {:.3}  RTF {} {:.2} {} {:.2} {} {:.2}  late {} dc {} xr {}   ",
                 engine.name(),
                 st.chunks,
                 st.in_rms,
@@ -1227,7 +1524,7 @@ fn main() -> anyhow::Result<()> {
                 st.rtf_vc,
                 names[2],
                 st.rtf_voc,
-                st.late
+                st.late, st.declicks, st.cross_repairs
             );
             std::io::stderr().flush().ok();
         }
@@ -1294,6 +1591,9 @@ fn run_tui(
                 st.passthrough,
                 st.status.clone(),
                 st.gated,
+                st.engine_info.clone(),
+                st.declicks,
+                st.cross_repairs,
             )
         };
         terminal.draw(|f| {
@@ -1301,7 +1601,7 @@ fn run_tui(
                 Constraint::Length(3),
                 Constraint::Length(3),
                 Constraint::Length(3),
-                Constraint::Length(5),
+                Constraint::Length(6),
                 Constraint::Min(3),
             ])
             .split(f.area());
@@ -1343,11 +1643,12 @@ fn run_tui(
             );
             let pitch = controls.pitch_decisemitones.load(Ordering::Relaxed) as f32 / 10.0;
             let mix = controls.denoise_mix.load(Ordering::Relaxed);
+            let bwe = controls.bwe_wet.load(Ordering::Relaxed);
             let gate = controls.gate_db.load(Ordering::Relaxed);
             let names = engine.stage_names();
             f.render_widget(
                 Paragraph::new(format!(
-                    "RTF  {} {:.2} · {} {:.2} · {} {:.2}\nchunks {} · late {} · gated {} · mode {}\npitch {:+.1} st ([ / ])  ·  denoise mix {}% (, / .)  ·  gate {} dB (- / =)",
+                    "RTF  {} {:.2} · {} {:.2} · {} {:.2}\nchunks {} · late {} · gated {} · dc {} · xr {} · mode {}\npitch {:+.1} st ([ / ])  ·  denoise mix {}% (, / .)  ·  gate {} dB (- / =)\nbwe exciter {}% (; / ')  ·  output 48 kHz  ·  {}",
                     names[0],
                     snapshot.2,
                     names[1],
@@ -1357,10 +1658,18 @@ fn run_tui(
                     snapshot.5,
                     snapshot.6,
                     snapshot.9,
+                    snapshot.11,
+                    snapshot.12,
                     if snapshot.7 { "PASSTHROUGH" } else { "CONVERT" },
                     pitch,
                     mix,
                     gate,
+                    bwe,
+                    if snapshot.10.is_empty() {
+                        "engine defaults"
+                    } else {
+                        snapshot.10.as_str()
+                    },
                 ))
                 .block(Block::default().borders(Borders::ALL).title(format!(
                     " pipeline — engine {} ",
@@ -1422,6 +1731,14 @@ fn run_tui(
                         controls
                             .denoise_mix
                             .store((v + 10).min(100), Ordering::Relaxed);
+                    }
+                    KeyCode::Char(';') => {
+                        let v = controls.bwe_wet.load(Ordering::Relaxed);
+                        controls.bwe_wet.store((v - 10).max(0), Ordering::Relaxed);
+                    }
+                    KeyCode::Char('\'') => {
+                        let v = controls.bwe_wet.load(Ordering::Relaxed);
+                        controls.bwe_wet.store((v + 10).min(100), Ordering::Relaxed);
                     }
                     KeyCode::Char('-') => {
                         let v = controls.gate_db.load(Ordering::Relaxed);

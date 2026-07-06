@@ -118,6 +118,18 @@ Usage:
 
 - offline: `cargo run --release -p xvc --example convert_xvc -- <source.wav> <reference.wav> <out.wav>`
 - live: `cargo run --release -p vc-demo --bin babiniku-demo -- --engine xvc --reference her_voice.wav`
+- live knobs against decoder needle ticks (issue #42): the SAC decoder
+  emits a short "needle" pulse per re-encoded window (present in the
+  official implementation too — 8 needles/4 s at the 640 ms CPU preset
+  vs 1 at the official 2400 ms GPU preset). Defense in depth:
+  `--window-ms` (default **2400 on CUDA**, 640 on CPU) shrinks the
+  needle rate at the source — the growth is all history, so latency is
+  unchanged (`longer_window_does_not_add_latency`) at ~1.6× worst-hop
+  compute (43 ms vs the 240 ms deadline on CUDA); the remainder is
+  removed by cross-window verification (one held hop, +240 ms latency;
+  disable with `--low-latency`) plus the 16 kHz `NeedleGuard`. On CPU
+  the short window keeps more needles — raise `--window-ms` only if
+  your box holds the deadline (watch `late` in the TUI).
 - weights: convert the official checkpoints once with
   `tools/convert_xvc_tokenizer.py`, `tools/convert_xvc_speaker.py`,
   `tools/convert_xvc_generator.py` →

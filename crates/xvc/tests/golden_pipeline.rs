@@ -287,3 +287,73 @@ fn stream_cpu_preset_matches_e2e_fixture() {
     assert!(c > 0.995, "stream corr {c}");
     assert!(ec > 0.995, "stream envelope corr {ec}");
 }
+
+/// Needle count of a waveform: |y| > 0.25 and > 4x the 3 ms local rms,
+/// clustered at 10 ms (the issue #42 field detector).
+fn needle_count(y: &[f32], sr: usize) -> usize {
+    let w = 3 * sr / 1000;
+    let mut count = 0;
+    let mut last_hit: isize = -(sr as isize);
+    for i in 0..y.len() {
+        let a = y[i].abs();
+        if a < 0.25 {
+            continue;
+        }
+        let lo = i.saturating_sub(w);
+        let hi = (i + w).min(y.len());
+        let rms = (y[lo..hi].iter().map(|s| s * s).sum::<f32>() / (hi - lo) as f32).sqrt();
+        if a > 4.0 * (rms + 1e-6) {
+            if i as isize - last_hit > (sr / 100) as isize {
+                count += 1;
+            }
+            last_hit = i as isize;
+        }
+    }
+    count
+}
+
+/// Issue #42 regression lock: the enlarged CUDA-default window (2400 ms,
+/// the official GPU preset) must keep shedding decoder needles vs the
+/// 640 ms CPU preset. Measured on the e2e fixture source: 6 -> 3 (the
+/// official Python implementation shows the same effect, 8 -> 1 with
+/// its 120 ms hop). If a refactor silently regresses the window pathway
+/// this pins it.
+#[test]
+fn larger_window_sheds_needles() {
+    let (Some(fx), Some(eng)) = (util::ckpt_fixture("xvc_e2e_fixture.safetensors"), engine())
+    else {
+        return;
+    };
+    let reference = Reference {
+        speaker_condition: fx["speaker_condition"].clone(),
+        frame_condition: fx["frame_condition"].clone(),
+    };
+    let source = samples(&fx["source_wav"]);
+    let mut counts = Vec::new();
+    for chunk_ms in [640, 2400] {
+        let cfg = StreamConfig {
+            chunk_ms,
+            ..Default::default()
+        };
+        let mut stream = eng.stream(reference.clone(), cfg).unwrap();
+        let mut got: Vec<f32> = Vec::with_capacity(source.len());
+        for chunk in source.chunks(cfg.current_len()) {
+            stream.push(chunk);
+            while let Some(step) = stream.step().unwrap() {
+                got.extend_from_slice(&step.samples);
+            }
+        }
+        got.extend_from_slice(&stream.finish().unwrap());
+        counts.push(needle_count(&got, 16_000));
+    }
+    println!("needles: 640 ms {} vs 2400 ms {}", counts[0], counts[1]);
+    assert!(
+        counts[1] < counts[0],
+        "the large window no longer sheds needles: {counts:?}"
+    );
+    assert!(
+        counts[1] <= 3,
+        "needle count at the CUDA default window regressed: {} (was 3)",
+        counts[1]
+    );
+}

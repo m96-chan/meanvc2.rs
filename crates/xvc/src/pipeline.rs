@@ -320,6 +320,13 @@ pub struct StreamConfig {
     pub future_ms: usize,
     /// Raised-cosine crossfade at chunk joins (`smooth_ms`).
     pub smooth_ms: usize,
+    /// Cross-window needle suppression (issue #42): delay emission by
+    /// one hop and verify each hop against the NEXT window's rendering
+    /// of the same region. The SAC decoder's needle pulses are
+    /// window-local, so a short run that is much sharper than the
+    /// neighbouring window's rendering is the needle, and the other
+    /// rendering replaces it. Costs one hop (`current_ms`) of latency.
+    pub cross_check: bool,
 }
 
 impl Default for StreamConfig {
@@ -332,6 +339,7 @@ impl Default for StreamConfig {
             current_ms: 240,
             future_ms: 100,
             smooth_ms: 20,
+            cross_check: false,
         }
     }
 }
@@ -344,6 +352,7 @@ impl StreamConfig {
             current_ms: 120,
             future_ms: 100,
             smooth_ms: 20,
+            cross_check: false,
         }
     }
 
@@ -375,6 +384,16 @@ impl StreamConfig {
         Self::samples(self.history_ms())
     }
 
+    /// Algorithmic latency in milliseconds: a hop becomes ready
+    /// `smooth + future` ms after its `current` span has been pushed,
+    /// plus the `current` ms of input accumulation itself. NOTE: the
+    /// window size (`chunk_ms`) does NOT appear here — growing the
+    /// window only grows `history` (= compute per hop), never the
+    /// latency. `longer_window_does_not_add_latency` pins this.
+    pub fn algorithmic_latency_ms(&self) -> usize {
+        self.current_ms + self.smooth_ms + self.future_ms
+    }
+
     fn validate(&self) -> Result<()> {
         if self.current_ms == 0 {
             return Err(Error::Input("current_ms must be > 0".into()));
@@ -382,6 +401,12 @@ impl StreamConfig {
         if self.chunk_ms < self.current_ms + self.smooth_ms + self.future_ms {
             return Err(Error::Input(
                 "chunk_ms must cover current + smooth + future".into(),
+            ));
+        }
+        if self.cross_check && self.history_len() < self.current_len() {
+            return Err(Error::Input(
+                "cross_check needs history >= current (the next window must cover the held hop)"
+                    .into(),
             ));
         }
         if self.chunk_len() % 1280 != 0 {
@@ -402,6 +427,9 @@ pub struct StreamStep {
     /// Per-stage wall time of the window forward (zero when the window
     /// was silent and the forward was skipped).
     pub timings: StageTimings,
+    /// Needle runs replaced by the cross-window check (0 unless
+    /// [`StreamConfig::cross_check`] is on).
+    pub cross_repairs: u32,
 }
 
 /// Input-side window assembly shared by [`XvcStream`] and
@@ -532,9 +560,14 @@ impl Crossfader {
     }
 }
 
-/// Extracts the emitted `current` slice and the next crossfade tail from
-/// one decoded window waveform `[1, 1, chunk_len]`.
-fn slice_window_wav(wav: &Tensor, cfg: &StreamConfig) -> Result<(Vec<f32>, Vec<f32>)> {
+/// One sliced window: the emitted `current` samples, the next crossfade
+/// tail, and — when [`StreamConfig::cross_check`] is on — this window's
+/// rendering of the PREVIOUS hop's region.
+type SlicedWindow = (Vec<f32>, Vec<f32>, Option<Vec<f32>>);
+
+/// Extracts a [`SlicedWindow`] from one decoded window waveform
+/// `[1, 1, chunk_len]`.
+fn slice_window_wav(wav: &Tensor, cfg: &StreamConfig) -> Result<SlicedWindow> {
     let wav = wav.i((0, 0))?;
     let out: Vec<f32> = wav
         .narrow(0, cfg.history_len(), cfg.current_len())?
@@ -542,7 +575,15 @@ fn slice_window_wav(wav: &Tensor, cfg: &StreamConfig) -> Result<(Vec<f32>, Vec<f
     let tail: Vec<f32> = wav
         .narrow(0, cfg.history_len() + cfg.current_len(), cfg.smooth_len())?
         .to_vec1()?;
-    Ok((out, tail))
+    let prev = if cfg.cross_check {
+        Some(
+            wav.narrow(0, cfg.history_len() - cfg.current_len(), cfg.current_len())?
+                .to_vec1()?,
+        )
+    } else {
+        None
+    };
+    Ok((out, tail, prev))
 }
 
 /// The stateless-window streaming driver (`run_streaming`) as an
@@ -559,6 +600,7 @@ pub struct XvcStream<'a> {
     reference: Reference,
     windower: Windower,
     fader: Crossfader,
+    checker: CrossChecker,
 }
 
 impl<'a> XvcStream<'a> {
@@ -568,6 +610,7 @@ impl<'a> XvcStream<'a> {
             reference,
             windower: Windower::new(cfg)?,
             fader: Crossfader::new(cfg.smooth_len()),
+            checker: CrossChecker::new(cfg.cross_check),
         })
     }
 
@@ -585,12 +628,17 @@ impl<'a> XvcStream<'a> {
         self.windower.ready()
     }
 
-    /// Runs one window if enough input is buffered.
+    /// Runs one window if enough input is buffered. With
+    /// [`StreamConfig::cross_check`] the very first window yields no hop
+    /// (it is held for verification), so this loops until a hop is ready
+    /// or input runs out.
     pub fn step(&mut self) -> Result<Option<StreamStep>> {
-        if !self.ready() {
-            return Ok(None);
+        while self.ready() {
+            if let Some(step) = self.step_padded()? {
+                return Ok(Some(step));
+            }
         }
-        self.step_padded()
+        Ok(None)
     }
 
     /// Runs the next window unconditionally, zero-padding missing input
@@ -603,24 +651,22 @@ impl<'a> XvcStream<'a> {
         // zero chunks): the decoded window is not exactly zero for zero
         // input, but the emitted slice is silence by construction here.
         let silent = window.iter().all(|&s| s == 0.0);
-        let (mut out, tail_next, timings) = if silent {
+        let (mut out, tail_next, prev, timings) = if silent {
             (
                 vec![0f32; cfg.current_len()],
                 vec![0f32; cfg.smooth_len()],
+                None,
                 StageTimings::default(),
             )
         } else {
             let fwd = self.engine.forward_window(&window, &self.reference)?;
-            let (out, tail) = slice_window_wav(&fwd.wav, &cfg)?;
-            (out, tail, fwd.timings)
+            let (out, tail, prev) = slice_window_wav(&fwd.wav, &cfg)?;
+            (out, tail, prev, fwd.timings)
         };
 
         self.fader.apply(index, &mut out, tail_next);
 
-        Ok(Some(StreamStep {
-            samples: out,
-            timings,
-        }))
+        Ok(self.checker.push(out, timings, prev.as_deref()))
     }
 
     /// End of input: emits the remaining windows
@@ -633,9 +679,11 @@ impl<'a> XvcStream<'a> {
         let total_windows = self.windower.total_windows();
         let mut out = Vec::new();
         while self.windower.next < total_windows {
-            let step = self
-                .step_padded()?
-                .expect("step_padded always yields below total_windows");
+            if let Some(step) = self.step_padded()? {
+                out.extend_from_slice(&step.samples);
+            }
+        }
+        if let Some(step) = self.checker.flush() {
             out.extend_from_slice(&step.samples);
         }
         // Total emitted = total_windows · current ≥ pushed: trim the tail.
@@ -643,6 +691,142 @@ impl<'a> XvcStream<'a> {
         out.truncate(self.windower.pushed.saturating_sub(emitted_before));
         Ok(out)
     }
+}
+
+/// One-hop hold-and-verify state for [`StreamConfig::cross_check`],
+/// shared by the sequential and pipelined drivers.
+///
+/// The SAC decoder occasionally emits a needle pulse (issue #42) whose
+/// position is a property of the WHOLE re-encoded window — the
+/// neighbouring window renders the same audio instant cleanly. Each hop
+/// is therefore held back until the next window has rendered, and short
+/// divergent runs where the held hop is much sharper than the other
+/// rendering are replaced by the other rendering. Both candidates are
+/// genuine model output, so — unlike an amplitude-threshold declicker —
+/// natural speech can never be "repaired" into something it isn't.
+struct CrossChecker {
+    enabled: bool,
+    held: Option<(Vec<f32>, StageTimings)>,
+}
+
+impl CrossChecker {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            held: None,
+        }
+    }
+
+    /// Feeds a freshly rendered hop plus the same window's rendering of
+    /// the previous hop's region (`None` for silent windows). Returns
+    /// the hop to emit now, if any.
+    fn push(
+        &mut self,
+        samples: Vec<f32>,
+        timings: StageTimings,
+        prev_render: Option<&[f32]>,
+    ) -> Option<StreamStep> {
+        if !self.enabled {
+            return Some(StreamStep {
+                samples,
+                timings,
+                cross_repairs: 0,
+            });
+        }
+        let emit = self.held.take().map(|(mut held, t)| {
+            let repairs = match prev_render {
+                Some(other) => cross_check_repair(&mut held, other),
+                None => 0,
+            };
+            StreamStep {
+                samples: held,
+                timings: t,
+                cross_repairs: repairs,
+            }
+        });
+        self.held = Some((samples, timings));
+        emit
+    }
+
+    /// End of input: emits the still-held final hop unverified.
+    fn flush(&mut self) -> Option<StreamStep> {
+        self.held.take().map(|(samples, timings)| StreamStep {
+            samples,
+            timings,
+            cross_repairs: 0,
+        })
+    }
+}
+
+/// Maximum replaceable divergence run (seconds) — needles are ≲2.5 ms.
+const XCHK_MAX_RUN_SECS: f32 = 0.0025;
+/// Margin crossfaded around a replaced run (samples).
+const XCHK_MARGIN: usize = 8;
+/// A run qualifies only when the held hop's sharpness exceeds the other
+/// rendering's by this factor — genuine re-rendering differences (phase
+/// drift, level) are symmetric in sharpness and never qualify.
+///
+/// The gate is deliberately LIBERAL (~2 replacements/second on live
+/// content). A replacement swaps in the other window's genuine
+/// rendering, crossfaded — the eighth field recording confirmed the
+/// audible ticks tracked the NeedleGuard's bridge repairs (dc), never
+/// the cross-check (xr), so liberal firing here is safe by
+/// construction while stricter gates measurably leak real needles
+/// (hardened variants let 5–21 needles through the worst-case suite).
+const XCHK_SHARPNESS: f32 = 2.5;
+/// Divergence floor: |held − other| must exceed this to open a run.
+const XCHK_DIV_FLOOR: f32 = 0.04;
+
+/// Replaces needle-suspect runs of `held` by `other` (the next window's
+/// rendering of the same samples). Returns the number of replaced runs.
+fn cross_check_repair(held: &mut [f32], other: &[f32]) -> u32 {
+    if held.len() != other.len() || held.is_empty() {
+        return 0;
+    }
+    let max_run = (XCHK_MAX_RUN_SECS * SAMPLE_RATE as f32) as usize;
+    // Divergence threshold: well above the typical re-rendering
+    // difference of THIS hop (median is immune to the short needle).
+    let mut mag: Vec<f32> = held.iter().zip(other).map(|(a, b)| (a - b).abs()).collect();
+    let mid = mag.len() / 2;
+    mag.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
+    let thr = (4.0 * mag[mid]).max(XCHK_DIV_FLOOR);
+
+    let sharpness = |x: &[f32], lo: usize, hi: usize| -> f32 {
+        let lo = lo.saturating_sub(XCHK_MARGIN);
+        let hi = (hi + XCHK_MARGIN).min(x.len());
+        x[lo..hi]
+            .windows(3)
+            .map(|w| (w[0] - 2.0 * w[1] + w[2]).abs())
+            .fold(0f32, f32::max)
+    };
+
+    let mut repairs = 0;
+    let mut i = 0;
+    while i < held.len() {
+        if (held[i] - other[i]).abs() <= thr {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        while j < held.len() && j - i <= max_run && (held[j] - other[j]).abs() > 0.5 * thr {
+            j += 1;
+        }
+        if j - i <= max_run && sharpness(held, i, j) > XCHK_SHARPNESS * sharpness(other, i, j) {
+            let lo = i.saturating_sub(XCHK_MARGIN);
+            let hi = (j + XCHK_MARGIN).min(held.len());
+            for k in lo..hi {
+                // Linear crossfade at both edges, full replacement inside.
+                let edge = (k - lo + 1).min(hi - k) as f32;
+                let w = (edge / (XCHK_MARGIN + 1) as f32).min(1.0);
+                held[k] = (1.0 - w) * held[k] + w * other[k];
+            }
+            repairs += 1;
+            i = hi;
+        } else {
+            i = j;
+        }
+    }
+    repairs
 }
 
 /// A window flowing between two pipeline stages: silent windows bypass
@@ -720,31 +904,37 @@ impl XvcPipelinedStream {
                 .name("xvc-window".into())
                 .spawn(move || {
                     let mut fader = Crossfader::new(cfg.smooth_len());
+                    let mut checker = CrossChecker::new(cfg.cross_check);
                     while let Ok(msg) = rx_job.recv() {
                         let out = match msg {
                             StageMsg::Silent { index } => {
                                 let mut out = vec![0f32; cfg.current_len()];
                                 fader.apply(index, &mut out, vec![0.0; cfg.smooth_len()]);
-                                Ok(StreamStep {
-                                    samples: out,
-                                    timings: StageTimings::default(),
-                                })
+                                Ok(checker.push(out, StageTimings::default(), None))
                             }
                             StageMsg::Work { index, payload, .. } => {
                                 engine.forward_window(&payload, &reference).and_then(|fwd| {
-                                    let (mut out, tail) = slice_window_wav(&fwd.wav, &cfg)?;
+                                    let (mut out, tail, prev) = slice_window_wav(&fwd.wav, &cfg)?;
                                     fader.apply(index, &mut out, tail);
-                                    Ok(StreamStep {
-                                        samples: out,
-                                        timings: fwd.timings,
-                                    })
+                                    Ok(checker.push(out, fwd.timings, prev.as_deref()))
                                 })
                             }
                         };
-                        let failed = out.is_err();
-                        if tx_step.send(out).is_err() || failed {
-                            break;
+                        match out {
+                            Ok(None) => {}
+                            Ok(Some(step)) => {
+                                if tx_step.send(Ok(step)).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                let _ = tx_step.send(Err(e));
+                                break;
+                            }
                         }
+                    }
+                    if let Some(step) = checker.flush() {
+                        let _ = tx_step.send(Ok(step));
                     }
                 })
                 .map_err(|e| Error::Input(format!("cannot spawn the xvc worker: {e}")))?;
@@ -836,16 +1026,14 @@ impl XvcPipelinedStream {
             .name("xvc-decode".into())
             .spawn(move || {
                 let mut fader = Crossfader::new(cfg.smooth_len());
+                let mut checker = CrossChecker::new(cfg.cross_check);
                 while let Ok(msg) = rx_acu.recv() {
                     let out = match msg {
                         Err(e) => Err(e),
                         Ok(StageMsg::Silent { index }) => {
                             let mut out = vec![0f32; cfg.current_len()];
                             fader.apply(index, &mut out, vec![0.0; cfg.smooth_len()]);
-                            Ok(StreamStep {
-                                samples: out,
-                                timings: StageTimings::default(),
-                            })
+                            Ok(checker.push(out, StageTimings::default(), None))
                         }
                         Ok(StageMsg::Work {
                             index,
@@ -855,20 +1043,28 @@ impl XvcPipelinedStream {
                             let t0 = Instant::now();
                             eng.decode_forward(&converter_out)
                                 .and_then(|wav| slice_window_wav(&wav, &cfg))
-                                .map(|(mut out, tail)| {
+                                .map(|(mut out, tail, prev)| {
                                     timings.decode = t0.elapsed();
                                     fader.apply(index, &mut out, tail);
-                                    StreamStep {
-                                        samples: out,
-                                        timings,
-                                    }
+                                    checker.push(out, timings, prev.as_deref())
                                 })
                         }
                     };
-                    let failed = out.is_err();
-                    if tx_step.send(out).is_err() || failed {
-                        break;
+                    match out {
+                        Ok(None) => {}
+                        Ok(Some(step)) => {
+                            if tx_step.send(Ok(step)).is_err() {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx_step.send(Err(e));
+                            break;
+                        }
                     }
+                }
+                if let Some(step) = checker.flush() {
+                    let _ = tx_step.send(Ok(step));
                 }
             })
             .map_err(|e| Error::Input(format!("cannot spawn the decode stage: {e}")))?;
@@ -992,6 +1188,131 @@ impl Drop for XvcPipelinedStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn longer_window_does_not_add_latency() {
+        // Issue #42: the CUDA default enlarges the window to shed
+        // decoder needles. The enlargement must land entirely in the
+        // HISTORY part — if a refactor ever grows future/smooth/current
+        // along with the window, latency silently increases and this
+        // fails.
+        let base = StreamConfig::default();
+        for chunk_ms in [640, 960, 1280, 1920, 2400] {
+            let cfg = StreamConfig {
+                chunk_ms,
+                ..Default::default()
+            };
+            cfg.validate().unwrap();
+            assert_eq!(cfg.current_ms, base.current_ms);
+            assert_eq!(cfg.smooth_ms, base.smooth_ms);
+            assert_eq!(cfg.future_ms, base.future_ms);
+            assert_eq!(
+                cfg.algorithmic_latency_ms(),
+                base.algorithmic_latency_ms(),
+                "window {chunk_ms} ms changed the algorithmic latency"
+            );
+            assert_eq!(
+                cfg.history_ms(),
+                chunk_ms - base.algorithmic_latency_ms(),
+                "window growth must go entirely into history"
+            );
+        }
+    }
+
+    #[test]
+    fn cross_check_repairs_sharp_lone_run() {
+        // Two renderings of the same vowel: slightly different (phase
+        // drift), but the held one carries a decoder needle.
+        let n = 3_840;
+        let f = 300.0 / SAMPLE_RATE as f32;
+        let mut held: Vec<f32> = (0..n)
+            .map(|i| 0.3 * (2.0 * std::f32::consts::PI * f * i as f32).sin())
+            .collect();
+        let other: Vec<f32> = (0..n)
+            .map(|i| 0.29 * (2.0 * std::f32::consts::PI * f * (i as f32 + 3.0)).sin())
+            .collect();
+        for k in 0..5 {
+            held[2_000 + k] = if k % 2 == 0 { 0.9 } else { -0.85 };
+        }
+        let repairs = cross_check_repair(&mut held, &other);
+        assert_eq!(repairs, 1);
+        let peak = held[1_980..2_030].iter().fold(0f32, |m, s| m.max(s.abs()));
+        assert!(peak < 0.4, "needle survived the cross-check: {peak}");
+    }
+
+    #[test]
+    fn cross_check_leaves_symmetric_divergence_alone() {
+        // Genuine re-rendering differences are symmetric in sharpness:
+        // nothing may be replaced even where the divergence is large.
+        let n = 3_840;
+        let f = 300.0 / SAMPLE_RATE as f32;
+        let held: Vec<f32> = (0..n)
+            .map(|i| 0.3 * (2.0 * std::f32::consts::PI * f * i as f32).sin())
+            .collect();
+        let other: Vec<f32> = (0..n)
+            .map(|i| 0.22 * (2.0 * std::f32::consts::PI * f * (i as f32 + 11.0)).sin())
+            .collect();
+        let mut checked = held.clone();
+        let repairs = cross_check_repair(&mut checked, &other);
+        assert_eq!(repairs, 0);
+        assert_eq!(checked, held);
+    }
+
+    #[test]
+    fn cross_check_keeps_genuine_plosives() {
+        // A real transient (plosive burst / attack) appears in BOTH
+        // renderings — sharp in both, so the sharpness-asymmetry gate
+        // must leave it bit-untouched even though it is short and the
+        // renderings differ slightly.
+        let n = 3_840;
+        let f = 300.0 / SAMPLE_RATE as f32;
+        let burst = |i: usize, k0: usize, amp: f32| -> f32 {
+            let d = i as f32 - k0 as f32;
+            if (0.0..24.0).contains(&d) {
+                amp * (0.7 * d).sin() * (1.0 - d / 24.0)
+            } else {
+                0.0
+            }
+        };
+        let held: Vec<f32> = (0..n)
+            .map(|i| 0.2 * (2.0 * std::f32::consts::PI * f * i as f32).sin() + burst(i, 2_000, 0.5))
+            .collect();
+        // The other rendering: slightly different level and a 2-sample
+        // shifted burst (window re-render jitter).
+        let other: Vec<f32> = (0..n)
+            .map(|i| {
+                0.19 * (2.0 * std::f32::consts::PI * f * (i as f32 + 2.0)).sin()
+                    + burst(i, 2_002, 0.47)
+            })
+            .collect();
+        let mut checked = held.clone();
+        let repairs = cross_check_repair(&mut checked, &other);
+        assert_eq!(repairs, 0, "genuine plosive was repaired away");
+        assert_eq!(checked, held);
+    }
+
+    #[test]
+    fn cross_checker_holds_one_hop() {
+        let mut c = CrossChecker::new(true);
+        let a = vec![1.0f32; 8];
+        let b = vec![2.0f32; 8];
+        assert!(c.push(a.clone(), StageTimings::default(), None).is_none());
+        let first = c.push(b, StageTimings::default(), None).unwrap();
+        assert_eq!(first.samples, a);
+        let last = c.flush().unwrap();
+        assert_eq!(last.samples, vec![2.0f32; 8]);
+        assert!(c.flush().is_none());
+    }
+
+    #[test]
+    fn cross_checker_disabled_is_passthrough() {
+        let mut c = CrossChecker::new(false);
+        let step = c
+            .push(vec![1.0f32; 8], StageTimings::default(), None)
+            .unwrap();
+        assert_eq!(step.samples, vec![1.0f32; 8]);
+        assert!(c.flush().is_none());
+    }
 
     #[test]
     fn stream_config_validates_alignment() {
