@@ -8,12 +8,16 @@
 //!   vocoder) plus small helpers such as [`encoders::upsample_bnf`].
 //! * [`audio`] — the audio front-end ([`audio::MelSpectrogram`], log-mel
 //!   extraction via `rustfft`).
+//! * [`bwe`] — bandwidth-extension post-processing for 16 kHz engine
+//!   output ([`bwe::Upsampler3x`] 16→48 kHz, [`bwe::Exciter`] harmonic
+//!   high-band synthesis; issue #42).
 //! * [`config::MelConfig`] — the mel front-end configuration.
 //! * [`Error`] / [`Result`] — the common error type.
 //!
 //! Everything model-specific lives in the engine crates.
 
 pub mod audio;
+pub mod bwe;
 pub mod config;
 pub mod encoders;
 

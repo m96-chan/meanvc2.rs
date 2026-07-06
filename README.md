@@ -20,7 +20,9 @@ cargo run --release -p vc-demo --features wavlm --bin babiniku-demo -- \
     --reference her_voice.wav --monitor --denoise
 ```
 
-Live TUI knobs while you speak: pitch (`[` `]`), noise suppression (`,` `.`), input gate (`-` `=`), passthrough A/B (`p`), self-monitor (`l`).
+Live TUI knobs while you speak: pitch (`[` `]`), noise suppression (`,` `.`), input gate (`-` `=`), bandwidth extension (`;` `'`), passthrough A/B (`p`), self-monitor (`l`).
+
+The engines synthesize at 16 kHz, so the demo upsamples the converted voice to **48 kHz in-process** (exact ×3 windowed-sinc) before playback — the virtual mic runs at 48 kHz and `--out` recordings are written at 48 kHz. On top of that, `--bwe <0-100>` (or the `;`/`'` knob, off by default) blends in a pure-DSP **harmonic exciter** that synthesizes the missing 8–16 kHz band (sibilance/"air") from the 3–8 kHz band — it lifts the "gauzy" veil of 16 kHz output at zero added latency, on every engine ([#42](https://github.com/m96-chan/babiniku.rs/issues/42)).
 
 Quit with `q` — or Ctrl-C / SIGTERM, which run the same clean teardown of the virtual devices; stale `babiniku` devices left by a killed run are recovered automatically at the next startup.
 
@@ -55,7 +57,7 @@ The repo is a cargo workspace — one crate per engine on a shared foundation:
 
 | Crate | What it is |
 |---|---|
-| [`crates/vc-core`](crates/vc-core) | Engine-agnostic foundation: encoder/speaker/vocoder traits, log-mel front-end, `Error`/`Result` |
+| [`crates/vc-core`](crates/vc-core) | Engine-agnostic foundation: encoder/speaker/vocoder traits, log-mel front-end, BWE post-processing (`bwe::Upsampler3x`, `bwe::Exciter`), `Error`/`Result` |
 | [`crates/meanvc`](crates/meanvc) | MeanVC v1 + MeanVC 2 engines (library name `meanvc2`), examples, golden tests |
 | [`crates/vc-demo`](crates/vc-demo) | The `babiniku-demo` real-time TUI / virtual-mic binary |
 | [`crates/xvc`](crates/xvc) | X-VC engine: GLM-4-Voice tokenizer, ERes2Net, SAC codec, prenet, MMDiT converter + the `XvcEngine` offline/streaming pipeline ([#30](https://github.com/m96-chan/babiniku.rs/issues/30)) |

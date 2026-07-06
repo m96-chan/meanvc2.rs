@@ -18,17 +18,29 @@
 //! `l` loopback monitor (hear the converted voice on the default output) ·
 //! `[` / `]` pitch shift −/+0.5 semitone (post-vocoder, Signalsmith
 //! Stretch) · `,` / `.` RNNoise denoise mix −/+10 % (pre-ASR, in-process;
-//! independent of the `--denoise` WebRTC stage).
+//! independent of the `--denoise` WebRTC stage) · `;` / `'` BWE exciter
+//! wet −/+10 % (bandwidth extension above 8 kHz, issue #42).
 //!
-//! Options: `--pitch-shift <semitones>` / `--denoise-mix <0-100>` set the
-//! initial knob values, `--denoise` inserts PipeWire's WebRTC noise suppression in
+//! Output path (issue #42): the engines synthesize at 16 kHz, so the
+//! converted chunks are upsampled in-process to **48 kHz**
+//! ([`vc_core::bwe::Upsampler3x`], exact ×3 windowed-sinc polyphase) and
+//! the playback stream opens at 48 kHz — this sidesteps PipeWire's own
+//! 16→48 resample and its measured −15.5 dB rolloff at 6.5–7.6 kHz.
+//! `--out` wavs are therefore written at **48 kHz** (input capture stays
+//! 16 kHz). On top of that, an optional harmonic exciter
+//! ([`vc_core::bwe::Exciter`], off by default) synthesizes the missing
+//! 8–16 kHz band; `--bwe <0-100>` sets the wet amount.
+//!
+//! Options: `--pitch-shift <semitones>` / `--denoise-mix <0-100>` /
+//! `--bwe <0-100>` set the initial knob values, `--denoise` inserts
+//! PipeWire's WebRTC noise suppression in
 //! front of the microphone (recommended for noisy mics),
 //! `--input-device <source>` records from a specific PulseAudio source,
 //! `--wav <file>` converts a wav file instead of the microphone
 //! (paced in real time), `--headless` disables the TUI, `--out <file>`
-//! additionally records the converted audio, `--no-sink` skips creating
-//! the virtual device, `--monitor` starts with the loopback enabled,
-//! `--duration <secs>` auto-stops (for testing).
+//! additionally records the converted audio (48 kHz), `--no-sink` skips
+//! creating the virtual device, `--monitor` starts with the loopback
+//! enabled, `--duration <secs>` auto-stops (for testing).
 //!
 //! Shutdown: SIGINT (Ctrl-C) and SIGTERM run the same clean teardown as
 //! `q`, unloading every pactl module the demo created; stale
@@ -56,9 +68,13 @@ use meanvc2::v1::{interpolate_linear, KaldiFbank, KvCache, MeanVc1, MeanVc1Confi
 use nnnoiseless::DenoiseState;
 use signalsmith_stretch::Stretch;
 use std::sync::atomic::AtomicI32;
+use vc_core::bwe::{Exciter, Upsampler3x};
 use xvc::preprocess::HighpassBiquad;
 
 const SR: usize = 16_000;
+/// Playback / `--out` sample rate: the 16 kHz engine output is upsampled
+/// ×3 in-process before it reaches the sink (issue #42).
+const OUT_SR: usize = 48_000;
 const CHUNK_SAMPLES: usize = 3_200; // 200 ms = one CARD chunk (20 mel frames)
 /// X-VC hop: 240 ms of new audio per re-encoded 640 ms window (the CPU
 /// streaming preset 640/240/100/20 from issue #30).
@@ -81,6 +97,8 @@ struct Controls {
     pitch_decisemitones: AtomicI32,
     /// RNNoise dry/wet mix in percent (0 = off).
     denoise_mix: AtomicI32,
+    /// BWE exciter wet amount in percent (0 = off; issue #42).
+    bwe_wet: AtomicI32,
     /// Input gate threshold in dBFS (chunk RMS); the model hallucinates
     /// voiced murmurs on silent input, so sub-threshold chunks bypass the
     /// DiT and emit silence. i32::MIN disables.
@@ -142,6 +160,7 @@ struct Args {
     input_device: Option<String>,
     pitch_shift: f32,
     denoise_mix: i32,
+    bwe: i32,
     gate_db: i32,
     headless: bool,
     no_sink: bool,
@@ -162,6 +181,7 @@ fn parse_args() -> Args {
         input_device: None,
         pitch_shift: 0.0,
         denoise_mix: 0,
+        bwe: 0,
         gate_db: -45,
         headless: false,
         no_sink: false,
@@ -205,6 +225,12 @@ fn parse_args() -> Args {
                     .next()
                     .and_then(|v| v.parse().ok())
                     .expect("--denoise-mix <0-100>")
+            }
+            "--bwe" => {
+                a.bwe = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .expect("--bwe <0-100>")
             }
             "--gate" => {
                 a.gate_db = it
@@ -548,11 +574,23 @@ fn xvc_device(_force_cpu: bool) -> Device {
     Device::Cpu
 }
 
+/// Capture spec: the engines consume 16 kHz input.
 fn pulse_spec() -> Spec {
     Spec {
         format: Format::FLOAT32NE,
         channels: 1,
         rate: SR as u32,
+    }
+}
+
+/// Playback spec: the output path upsamples to 48 kHz in-process
+/// (issue #42), so the sink stream opens at 48 kHz and PipeWire never
+/// resamples the converted voice itself.
+fn pulse_spec_out() -> Spec {
+    Spec {
+        format: Format::FLOAT32NE,
+        channels: 1,
+        rate: OUT_SR as u32,
     }
 }
 
@@ -837,6 +875,7 @@ fn main() -> anyhow::Result<()> {
     let controls = Arc::new(Controls {
         pitch_decisemitones: AtomicI32::new((args.pitch_shift * 10.0).round() as i32),
         denoise_mix: AtomicI32::new(args.denoise_mix.clamp(0, 100)),
+        bwe_wet: AtomicI32::new(args.bwe.clamp(0, 100)),
         gate_db: AtomicI32::new(args.gate_db),
     });
     let stats = Arc::new(Mutex::new(Stats {
@@ -945,6 +984,11 @@ fn main() -> anyhow::Result<()> {
     let output = std::thread::spawn(move || -> anyhow::Result<()> {
         let mut stretch = Stretch::preset_default(1, SR as u32);
         let mut current_semi = 0f32;
+        // Bandwidth extension (issue #42): exact ×3 upsampling to 48 kHz
+        // plus the optional harmonic exciter, after the pitch shifter.
+        let mut upsampler = Upsampler3x::new();
+        let mut exciter = Exciter::new(OUT_SR as f32);
+        let mut chunk48: Vec<f32> = Vec::new();
         let play = if sink_ok {
             Some(
                 Simple::new(
@@ -953,7 +997,7 @@ fn main() -> anyhow::Result<()> {
                     Direction::Playback,
                     Some(SINK),
                     "converted",
-                    &pulse_spec(),
+                    &pulse_spec_out(),
                     None,
                     None,
                 )
@@ -967,7 +1011,7 @@ fn main() -> anyhow::Result<()> {
                 p,
                 hound::WavSpec {
                     channels: 1,
-                    sample_rate: SR as u32,
+                    sample_rate: OUT_SR as u32,
                     bits_per_sample: 16,
                     sample_format: hound::SampleFormat::Int,
                 },
@@ -1032,12 +1076,19 @@ fn main() -> anyhow::Result<()> {
             } else {
                 chunk
             };
+            // Bandwidth extension (issue #42): 16 → 48 kHz windowed-sinc
+            // upsampling, then the harmonic exciter fills 8–16 kHz when
+            // the wet knob is open (0 % = bit-exact bypass).
+            chunk48.clear();
+            upsampler.process(&chunk, &mut chunk48);
+            let wet = controls_out.bwe_wet.load(Ordering::Relaxed).clamp(0, 100) as f32 / 100.0;
+            exciter.process(&mut chunk48, wet);
             if let Some(p) = &play {
-                let bytes: Vec<u8> = chunk.iter().flat_map(|s| s.to_ne_bytes()).collect();
+                let bytes: Vec<u8> = chunk48.iter().flat_map(|s| s.to_ne_bytes()).collect();
                 p.write(&bytes).map_err(|e| anyhow::anyhow!("write: {e}"))?;
             }
             if let Some(w) = writer.as_mut() {
-                for s in &chunk {
+                for s in &chunk48 {
                     w.write_sample((s.clamp(-1.0, 1.0) * 32767.0) as i16)?;
                 }
             }
@@ -1301,7 +1352,7 @@ fn run_tui(
                 Constraint::Length(3),
                 Constraint::Length(3),
                 Constraint::Length(3),
-                Constraint::Length(5),
+                Constraint::Length(6),
                 Constraint::Min(3),
             ])
             .split(f.area());
@@ -1343,11 +1394,12 @@ fn run_tui(
             );
             let pitch = controls.pitch_decisemitones.load(Ordering::Relaxed) as f32 / 10.0;
             let mix = controls.denoise_mix.load(Ordering::Relaxed);
+            let bwe = controls.bwe_wet.load(Ordering::Relaxed);
             let gate = controls.gate_db.load(Ordering::Relaxed);
             let names = engine.stage_names();
             f.render_widget(
                 Paragraph::new(format!(
-                    "RTF  {} {:.2} · {} {:.2} · {} {:.2}\nchunks {} · late {} · gated {} · mode {}\npitch {:+.1} st ([ / ])  ·  denoise mix {}% (, / .)  ·  gate {} dB (- / =)",
+                    "RTF  {} {:.2} · {} {:.2} · {} {:.2}\nchunks {} · late {} · gated {} · mode {}\npitch {:+.1} st ([ / ])  ·  denoise mix {}% (, / .)  ·  gate {} dB (- / =)\nbwe exciter {}% (; / ')  ·  output 48 kHz",
                     names[0],
                     snapshot.2,
                     names[1],
@@ -1361,6 +1413,7 @@ fn run_tui(
                     pitch,
                     mix,
                     gate,
+                    bwe,
                 ))
                 .block(Block::default().borders(Borders::ALL).title(format!(
                     " pipeline — engine {} ",
@@ -1422,6 +1475,14 @@ fn run_tui(
                         controls
                             .denoise_mix
                             .store((v + 10).min(100), Ordering::Relaxed);
+                    }
+                    KeyCode::Char(';') => {
+                        let v = controls.bwe_wet.load(Ordering::Relaxed);
+                        controls.bwe_wet.store((v - 10).max(0), Ordering::Relaxed);
+                    }
+                    KeyCode::Char('\'') => {
+                        let v = controls.bwe_wet.load(Ordering::Relaxed);
+                        controls.bwe_wet.store((v + 10).min(100), Ordering::Relaxed);
                     }
                     KeyCode::Char('-') => {
                         let v = controls.gate_db.load(Ordering::Relaxed);

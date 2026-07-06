@@ -13,6 +13,7 @@ name = "babiniku-demo"
 path = "src/bin/demo.rs"
 
 [dependencies]
+vc-core = { workspace = true }
 meanvc = { workspace = true }
 xvc = { workspace = true }
 candle-core = { workspace = true }
