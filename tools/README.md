@@ -48,3 +48,20 @@ Fixtures come in two tiers:
 | | `ckpt/pipeline_ref.safetensors` | `v1::KaldiFbank` vs `torchaudio.compliance.kaldi.fbank` (< 1e-3) and the full BNF path vs the official chunked decode loop (< 0.05) | ✅ |
 | `gen_mel_fixture.py` | `fixtures/mel.safetensors` | `MelSpectrogram` vs torchaudio | planned (#8) |
 | `convert_ecapa.py` | — | SpeechBrain ECAPA checkpoint → safetensors + golden output | planned (#8) |
+| `gen_xvc_fixtures.py` | `ckpt/xvc_preprocess_fixture.safetensors` | X-VC preprocessing: volume-norm + 40 Hz highpass + pad-to-1280 (< 1e-5) and the Whisper 128-mel log spectrogram (< 1e-4) | ✅ |
+| | `ckpt/xvc_tokenizer_fixture.safetensors` | GLM-4-Voice tokenizer: pre/post-VQ hidden states (< 1e-3), VQ token ids (exact), 50 Hz hidden, `embed_ids`, semantic adapter (< 1e-4) | ✅ |
+| | `ckpt/xvc_speaker_fixture.safetensors` | ERes2Net: Kaldi fbank-80 mean-norm (< 1e-3) → 192-d embedding (cos > 0.9999) | ✅ |
+| | `ckpt/xvc_codec_fixture.safetensors` | SAC acoustic codec: encode `z`/`z_e`/`zq` (< 1e-4) + codes (exact); decode latent → wav (< 5e-3) | ✅ |
+| | `ckpt/xvc_converter_fixture.safetensors` | MMDiT `AcousticConverter` single step, seeded random inputs (< 1e-4) | ✅ |
+| | `ckpt/xvc_chain_fixture.safetensors` | one 640 ms streaming chunk forward with every stage intermediate + crossfade slices | ✅ |
+| | `ckpt/xvc_e2e_fixture.safetensors` | out.wav → test.wav end to end: offline + streaming (official 2400/120/100/20 and CPU 640/240/100/20 presets) | ✅ |
+| | `ckpt/xvc_inventory.json` | module path → tensor shape for `xvc.pt` / GLM-4-Voice tokenizer / ERes2Net (porting reference) | ✅ |
+
+The X-VC fixtures ([issue #30](https://github.com/m96-chan/babiniku.rs/issues/30)
+Phase 1) need the official [Jerrister/X-VC](https://github.com/Jerrister/X-VC)
+clone with its checkpoints (`ckpts/xvc.pt`, `glm-4-voice-tokenizer/`,
+`pretrained/speech_eres2net_sv_en_voxceleb_16k/`) — see the script header:
+
+```sh
+python3 tools/gen_xvc_fixtures.py --xvc-repo ~/tmp/xvc-recon/X-VC
+```
