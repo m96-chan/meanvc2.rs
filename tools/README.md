@@ -57,6 +57,7 @@ Fixtures come in two tiers:
 | | `ckpt/xvc_chain_fixture.safetensors` | one 640 ms streaming chunk forward with every stage intermediate + crossfade slices | ✅ |
 | | `ckpt/xvc_e2e_fixture.safetensors` | out.wav → test.wav end to end: offline + streaming (official 2400/120/100/20 and CPU 640/240/100/20 presets) | ✅ |
 | | `ckpt/xvc_inventory.json` | module path → tensor shape for `xvc.pt` / GLM-4-Voice tokenizer / ERes2Net (porting reference) | ✅ |
+| `convert_xvc_speaker.py` | `ckpt/xvc_speaker.safetensors` | ERes2Net speaker-encoder weights from `xvc.pt` (`speaker_encoder.model.*` — its BatchNorm running stats drifted from the ModelScope release during X-VC training) → `xvc::speaker::SpeakerEncoder`, verified by `crates/xvc/tests/golden_speaker.rs` | ✅ |
 
 The X-VC fixtures ([issue #30](https://github.com/m96-chan/babiniku.rs/issues/30)
 Phase 1) need the official [Jerrister/X-VC](https://github.com/Jerrister/X-VC)

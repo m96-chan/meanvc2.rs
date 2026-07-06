@@ -13,6 +13,7 @@ categories = ["multimedia::audio", "science"]
 vc-core = { workspace = true }
 candle-core = { workspace = true }
 candle-nn = { workspace = true }
+rustfft = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
