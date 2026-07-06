@@ -194,6 +194,31 @@ fn read_wav_16k(path: &str) -> anyhow::Result<Vec<f32>> {
     Ok(s.into_iter().step_by(spec.channels as usize).collect())
 }
 
+/// Voice print: precomputed safetensors if present, otherwise (feature
+/// "wavlm") computed natively from the reference audio via the ONNX
+/// WavLM-Large SV model at ckpt/wavlm_sv.onnx.
+fn load_voice_print(args: &Args, reference: &[f32], device: &Device) -> anyhow::Result<Tensor> {
+    if std::path::Path::new(&args.voice_print).exists() {
+        let vp = candle_core::safetensors::load(&args.voice_print, device)?;
+        return vp
+            .get("voice_print")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("voice_print tensor missing in {}", args.voice_print));
+    }
+    #[cfg(feature = "wavlm")]
+    {
+        use meanvc2::encoders::SpeakerEncoder;
+        eprintln!("voice-print file not found; computing with WavLM (ckpt/wavlm_sv.onnx)…");
+        let sv = meanvc2::backends::WavLmSv::load("ckpt/wavlm_sv.onnx")?;
+        Ok(sv.embed(reference, SR)?)
+    }
+    #[cfg(not(feature = "wavlm"))]
+    anyhow::bail!(
+        "voice-print file {} not found; either precompute it or rebuild with --features demo,wavlm",
+        args.voice_print
+    )
+}
+
 fn pulse_spec() -> Spec {
     Spec {
         format: Format::FLOAT32NE,
@@ -231,11 +256,7 @@ fn main() -> anyhow::Result<()> {
     )?;
     let reference = read_wav_16k(&args.reference)?;
     let prompt_mel = MelV1::new().compute(&reference, &device)?.unsqueeze(0)?;
-    let vp = candle_core::safetensors::load(&args.voice_print, &device)?;
-    let spks = vp
-        .get("voice_print")
-        .ok_or_else(|| anyhow::anyhow!("voice_print tensor missing in {}", args.voice_print))?
-        .unsqueeze(0)?;
+    let spks = load_voice_print(&args, &reference, &device)?.unsqueeze(0)?;
 
     let modules = if args.no_sink {
         Vec::new()

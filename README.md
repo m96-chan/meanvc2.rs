@@ -124,9 +124,11 @@ The JVP inside the mean-flows target is computed **exactly** with forward-mode A
 `meanvc-demo` converts your microphone in real time and exposes the result as a **virtual microphone** (`MeanVC-Virtual-Mic`, via a PipeWire/PulseAudio null sink) selectable from any app:
 
 ```sh
-cargo run --release --features demo --bin meanvc-demo -- \
-    --reference target_voice.wav --voice-print voice_print.safetensors
+cargo run --release --features demo,wavlm --bin meanvc-demo -- \
+    --reference target_voice.wav
 ```
+
+With the `wavlm` feature the 256-dim voice print is computed natively from the reference audio (export the ONNX model once with `tools/export_wavlm_onnx.py`); without it, pass a precomputed `--voice-print file.safetensors`.
 
 TUI shows level meters, per-stage RTF, and supports `p` (passthrough A/B), `l` (loopback monitor — hear the converted voice on your speakers), `q` (quit; removes the virtual device). `--monitor` starts with the loopback on. `--wav file.wav` streams a file instead of the mic, `--headless` / `--out out.wav` / `--duration N` support scripted runs. Requires the checkpoints under `ckpt/` (see `examples/convert_v1.rs`) and `pactl`. The ASR stage streams incrementally with `FastU2pp::forward_chunk` (per-layer attention K/V + conv caches, exact WeNet `forward_chunk` parity — issue #9). Measured with `RAYON_NUM_THREADS=8`: per-stage RTF ≈ 0.06 (ASR) / 0.04 (VC) / 0.06 (vocoder), late = 0 sustained.
 
@@ -146,6 +148,7 @@ MeanVC 2 trains only the UTTE and the DiT decoder. The three frozen components a
 |---|---|---|---|
 | Semantic (BNF) extractor | `SemanticEncoder` | `backends::FastU2pp` (WeNet U2++ conformer port) | [Fast-U2++](https://github.com/wenet-e2e/wenet) (WeNet), 80 ms chunks, 40 ms frames |
 | Speaker encoder | `SpeakerEncoder` | `backends::Ecapa` (SpeechBrain-layout port) | [ECAPA-TDNN](https://github.com/speechbrain/speechbrain), 192-dim |
+| Voice print (v1) | `SpeakerEncoder` | `backends::WavLmSv` (ONNX Runtime, feature `wavlm`) | WavLM-Large SV ([UniSpeech](https://github.com/microsoft/UniSpeech)), 256-dim |
 | Vocoder | `Vocoder` | `backends::Vocos` (ConvNeXt + ISTFT port) | [Vocos](https://github.com/gemelo-ai/vocos), 16 kHz |
 
 Each backend's module tree mirrors its upstream implementation so converted safetensors checkpoints map 1:1 (`FastU2pp::load` / `Ecapa::load` / `Vocos::load`); checkpoint conversion scripts and golden-output validation are tracked in [#4](https://github.com/m96-chan/meanvc2.rs/issues/4). The full wav-to-wav pipeline runs end to end with random weights:

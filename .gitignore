@@ -7,3 +7,6 @@ Cargo.lock
 
 # local checkpoints + generated v1 parity fixtures (may be a symlink)
 /ckpt
+
+# agent worktrees
+/.claude/worktrees/

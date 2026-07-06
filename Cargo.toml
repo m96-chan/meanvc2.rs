@@ -18,6 +18,7 @@ thiserror = "2"
 # TUI demo (feature "demo")
 anyhow = { version = "1", optional = true }
 num_cpus = { version = "1", optional = true }
+ort = { version = "2.0.0-rc.10", optional = true }
 ratatui = { version = "0.29", optional = true }
 crossterm = { version = "0.28", optional = true }
 libpulse-binding = { version = "2", optional = true }
@@ -32,6 +33,7 @@ num_cpus = "1"
 [features]
 default = []
 demo = ["dep:anyhow", "dep:num_cpus", "dep:ratatui", "dep:crossterm", "dep:libpulse-binding", "dep:libpulse-simple-binding", "dep:hound"]
+wavlm = ["dep:ort"]
 cuda = ["candle-core/cuda", "candle-nn/cuda"]
 metal = ["candle-core/metal", "candle-nn/metal"]
 
