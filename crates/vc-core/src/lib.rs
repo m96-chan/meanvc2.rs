@@ -21,6 +21,7 @@ pub mod bwe;
 pub mod config;
 pub mod declick;
 pub mod encoders;
+pub mod profile;
 
 pub use config::MelConfig;
 
