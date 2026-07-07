@@ -818,10 +818,11 @@ fn load_voice_print(
     )
 }
 
-/// Device for the X-VC engine: CPU is the project baseline (never
-/// requires a GPU); a build with `--features cuda` places the whole
-/// engine on `cuda:0` when one is present (`--cpu` opts out). The
-/// meanvc engine stays on CPU — it is already real time there.
+/// Accelerator selection for the X-VC and Seed-VC engines: CPU is the
+/// project baseline (never requires a GPU); a build with
+/// `--features cuda` places the whole engine on `cuda:0` when one is
+/// present (`--cpu` opts out). The meanvc engine stays on CPU — it is
+/// already real time there.
 #[cfg(feature = "cuda")]
 fn xvc_device(force_cpu: bool) -> Device {
     if force_cpu {
@@ -829,7 +830,7 @@ fn xvc_device(force_cpu: bool) -> Device {
     }
     match Device::new_cuda(0) {
         Ok(d) => {
-            eprintln!("xvc engine on cuda:0");
+            eprintln!("accelerator: cuda:0");
             d
         }
         Err(e) => {
