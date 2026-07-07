@@ -1,0 +1,21 @@
+[package]
+name = "seedvc"
+version = "0.1.0"
+edition.workspace = true
+# NOTE: deliberately NOT `license.workspace = true` — the upstream
+# Seed-VC code and weights are GPL-3.0, so this engine crate is GPL-3.0
+# and is feature-gated in vc-demo. Binaries built WITHOUT the `seedvc`
+# feature remain MIT OR Apache-2.0.
+license = "GPL-3.0"
+
+[dependencies]
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+vc-core = { path = "../vc-core" }
+rustfft = { workspace = true }
+
+[dev-dependencies]
+hound = { workspace = true }
+
+[features]
+cuda = ["candle-core/cuda", "candle-nn/cuda"]

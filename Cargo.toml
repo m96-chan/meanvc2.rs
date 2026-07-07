@@ -5,6 +5,7 @@ members = [
     "crates/meanvc",
     "crates/vc-demo",
     "crates/xvc",
+    "crates/seedvc",
 ]
 
 [workspace.package]
