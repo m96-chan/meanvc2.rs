@@ -3,9 +3,12 @@
 //! Captures the default microphone, converts the voice chunk by chunk
 //! with the selected engine (`--engine meanvc` (default, 200 ms chunks) or
 //! `--engine xvc` (240 ms hop, 640 ms re-encoded window — the official
-//! X-VC CPU streaming preset)), and plays the result into a
+//! X-VC CPU streaming preset)), and plays the result into the platform's
+//! **virtual microphone** route (issue #51, `vc_demo::audio`): on Linux a
 //! PulseAudio/PipeWire null sink whose remapped monitor shows up as a
-//! selectable **virtual microphone** (`babiniku_mic`) in other apps.
+//! selectable source (`babiniku_mic`); on Windows/macOS a user-installed
+//! loopback device (VB-CABLE / BlackHole), auto-detected or chosen with
+//! `--output-device`.
 //!
 //! ```sh
 //! cargo run --release -p vc-demo --bin babiniku-demo -- \
@@ -35,7 +38,9 @@
 //! `--bwe <0-100>` set the initial knob values, `--denoise` inserts
 //! PipeWire's WebRTC noise suppression in
 //! front of the microphone (recommended for noisy mics),
-//! `--input-device <source>` records from a specific PulseAudio source,
+//! `--input-device <source>` records from a specific capture device,
+//! `--output-device <name>` routes the converted voice to a specific
+//! playback device (non-Linux virtual-mic routing),
 //! `--wav <file>` converts a wav file instead of the microphone
 //! (paced in real time), `--headless` disables the TUI, `--out <file>`
 //! additionally records the converted audio (48 kHz), `--no-sink` skips
@@ -53,15 +58,11 @@
 //! each chunk with a 200 ms mel tail as context (tracked in #9).
 
 use std::io::Write as _;
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use candle_core::{Device, Tensor};
-use libpulse_binding::sample::{Format, Spec};
-use libpulse_binding::stream::Direction;
-use libpulse_simple_binding::Simple;
 use meanvc2::backends::{FastU2pp, FastU2ppConfig, Vocos, VocosConfig};
 use meanvc2::encoders::Vocoder;
 use meanvc2::v1::{interpolate_linear, KaldiFbank, KvCache, MeanVc1, MeanVc1Config, MelV1};
@@ -69,6 +70,7 @@ use nnnoiseless::DenoiseState;
 use signalsmith_stretch::Stretch;
 use std::sync::atomic::AtomicI32;
 use vc_core::bwe::{Exciter, Upsampler3x};
+use vc_demo::audio::{self, AudioBackend};
 use xvc::preprocess::HighpassBiquad;
 
 const SR: usize = 16_000;
@@ -92,8 +94,6 @@ const MEL_TAIL: usize = 32; // vocoder left context, in mel frames (320 ms)
 /// end of the previous chunk; holding back FADE samples and cross-fading
 /// removes the phase discontinuity at the join.
 const FADE: usize = 160;
-const SINK: &str = "babiniku";
-const VIRT_MIC: &str = "babiniku_mic";
 
 /// Live-tunable knobs shared with the TUI thread.
 struct Controls {
@@ -182,6 +182,9 @@ struct Args {
     wav: Option<String>,
     out: Option<String>,
     input_device: Option<String>,
+    /// Playback device the converted voice is routed to (non-Linux
+    /// virtual-mic routing, e.g. "CABLE Input" / "BlackHole 2ch").
+    output_device: Option<String>,
     pitch_shift: f32,
     denoise_mix: i32,
     /// Output-side RNNoise wet % (Seed-VC).
@@ -223,6 +226,7 @@ fn parse_args() -> Args {
         wav: None,
         out: None,
         input_device: None,
+        output_device: None,
         pitch_shift: 0.0,
         denoise_mix: 0,
         out_denoise: 0,
@@ -252,7 +256,11 @@ fn parse_args() -> Args {
                     other => {
                         eprintln!(
                             "--engine must be meanvc or xvc{} (got {other:?})",
-                            if cfg!(feature = "seedvc") { " or seedvc" } else { "" }
+                            if cfg!(feature = "seedvc") {
+                                " or seedvc"
+                            } else {
+                                ""
+                            }
                         );
                         std::process::exit(2);
                     }
@@ -327,6 +335,7 @@ fn parse_args() -> Args {
                     .expect("--gate <dBFS, e.g. -45>")
             }
             "--input-device" => a.input_device = Some(it.next().expect("--input-device <source>")),
+            "--output-device" => a.output_device = Some(it.next().expect("--output-device <name>")),
             "--duration" => a.duration = it.next().and_then(|s| s.parse().ok()),
             other => {
                 eprintln!("unknown flag {other}");
@@ -336,36 +345,6 @@ fn parse_args() -> Args {
     }
     a
 }
-
-/// Creates the null sink + remapped virtual microphone; returns module ids.
-fn create_virtual_device() -> anyhow::Result<Vec<String>> {
-    let load = |args: &[&str]| -> anyhow::Result<String> {
-        let out = Command::new("pactl")
-            .arg("load-module")
-            .args(args)
-            .output()?;
-        anyhow::ensure!(
-            out.status.success(),
-            "pactl load-module failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    };
-    let sink = load(&[
-        "module-null-sink",
-        &format!("sink_name={SINK}"),
-        "sink_properties=device.description=Babiniku-Output",
-    ])?;
-    let mic = load(&[
-        "module-remap-source",
-        &format!("source_name={VIRT_MIC}"),
-        &format!("master={SINK}.monitor"),
-        "source_properties=device.description=Babiniku-Virtual-Mic",
-    ])?;
-    Ok(vec![sink, mic])
-}
-
-const DENOISED_SRC: &str = "babiniku_denoised";
 
 /// In-process RNNoise at its native 48 kHz, for the OUTPUT side of the
 /// Seed-VC path (field report: a faint noise bed under the converted
@@ -403,8 +382,7 @@ impl Rnnoise48k {
             let mut den = vec![0f32; DenoiseState::FRAME_SIZE];
             self.state.process_frame(&mut den, &frame);
             for (d, raw) in den.iter().zip(&frame) {
-                self.out
-                    .push((d * mix + raw * (1.0 - mix)) / 32768.0);
+                self.out.push((d * mix + raw * (1.0 - mix)) / 32768.0);
             }
         }
         for (i, s) in chunk.iter_mut().enumerate() {
@@ -459,130 +437,6 @@ impl Rnnoise16k {
                 (a + b + c) / (3.0 * 32768.0)
             })
             .collect()
-    }
-}
-
-/// PipeWire/Pulse WebRTC noise suppression in front of the microphone:
-/// creates a cleaned source the input thread records from. Returns the
-/// pactl module id.
-fn create_denoiser(master: Option<&str>) -> anyhow::Result<String> {
-    let mut cmd = Command::new("pactl");
-    cmd.args([
-        "load-module",
-        "module-echo-cancel",
-        &format!("source_name={DENOISED_SRC}"),
-        "aec_method=webrtc",
-        "source_properties=device.description=Babiniku-Denoised-Input",
-    ]);
-    if let Some(m) = master {
-        cmd.arg(format!("source_master={m}"));
-    }
-    let out = cmd.output()?;
-    anyhow::ensure!(
-        out.status.success(),
-        "pactl module-echo-cancel failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
-
-/// Loopback monitor: routes the converted audio to the default output so
-/// the user can hear it. Returns the pactl module id.
-struct Monitor(Mutex<Option<String>>);
-
-impl Monitor {
-    fn toggle(&self) -> anyhow::Result<bool> {
-        let mut slot = self.0.lock().unwrap();
-        match slot.take() {
-            Some(id) => {
-                let _ = Command::new("pactl").args(["unload-module", &id]).status();
-                Ok(false)
-            }
-            None => {
-                let out = Command::new("pactl")
-                    .args([
-                        "load-module",
-                        "module-loopback",
-                        &format!("source={SINK}.monitor"),
-                        "latency_msec=60",
-                    ])
-                    .output()?;
-                anyhow::ensure!(
-                    out.status.success(),
-                    "pactl module-loopback failed: {}",
-                    String::from_utf8_lossy(&out.stderr)
-                );
-                *slot = Some(String::from_utf8_lossy(&out.stdout).trim().to_string());
-                Ok(true)
-            }
-        }
-    }
-
-    fn off(&self) {
-        let mut slot = self.0.lock().unwrap();
-        if let Some(id) = slot.take() {
-            let _ = Command::new("pactl").args(["unload-module", &id]).status();
-        }
-    }
-}
-
-fn destroy_virtual_device(modules: &[String]) {
-    for m in modules.iter().rev() {
-        let _ = Command::new("pactl").args(["unload-module", m]).status();
-    }
-}
-
-/// Parses `pactl list modules short` output (`id\tname\targuments`) and
-/// returns the `(id, name)` of every module that owns one of our device
-/// names — leftovers from a previous run that was killed before teardown
-/// (issue #39). Matching is exact on whole argument tokens
-/// (`sink_name=babiniku` etc.), so devices that merely contain the word
-/// are left alone.
-fn stale_babiniku_modules(listing: &str) -> Vec<(String, String)> {
-    let owned = [
-        format!("sink_name={SINK}"),
-        format!("source_name={VIRT_MIC}"),
-        format!("source_name={DENOISED_SRC}"),
-        format!("source={SINK}.monitor"),
-    ];
-    listing
-        .lines()
-        .filter_map(|line| {
-            let mut cols = line.splitn(3, '\t');
-            let id = cols.next()?.trim();
-            let name = cols.next()?.trim();
-            let args = cols.next().unwrap_or("");
-            args.split_whitespace()
-                .any(|kv| owned.iter().any(|o| kv == o))
-                .then(|| (id.to_string(), name.to_string()))
-        })
-        .collect()
-}
-
-/// Belt-and-braces startup recovery: unloads the stale modules found by
-/// [`stale_babiniku_modules`] before fresh devices are created, and logs
-/// what was recovered. Dependents (remap source, loopback) were loaded
-/// after the null sink, so unloading in reverse listing order tears them
-/// down first; a module that already disappeared is not an error.
-fn recover_stale_modules() {
-    let out = Command::new("pactl")
-        .args(["list", "modules", "short"])
-        .output();
-    let listing = match out {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
-        // No pulse daemon — device creation will report the real error.
-        _ => return,
-    };
-    for (id, name) in stale_babiniku_modules(&listing).iter().rev() {
-        let ok = Command::new("pactl")
-            .args(["unload-module", id])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        eprintln!(
-            "recovered stale {name} (module {id}) left by a previous run{}",
-            if ok { "" } else { " — unload failed" }
-        );
     }
 }
 
@@ -678,8 +532,7 @@ impl OutputLeveler {
     }
 
     fn process(&mut self, chunk: &mut [f32]) {
-        let rms =
-            (chunk.iter().map(|s| s * s).sum::<f32>() / chunk.len().max(1) as f32).sqrt();
+        let rms = (chunk.iter().map(|s| s * s).sum::<f32>() / chunk.len().max(1) as f32).sqrt();
         if rms > Self::GATE {
             self.est += Self::ALPHA * (rms - self.est);
             // Cap raised 4 -> 10: the field recording showed speech rms
@@ -748,104 +601,6 @@ impl MicVolumeNormalizer {
     }
 }
 
-#[cfg(test)]
-mod norm_tests {
-    use super::*;
-
-    /// Chunked processing of a steady tone must not introduce level steps
-    /// at chunk boundaries while the gain estimate adapts (issue #42
-    /// field report: ticks during a sustained vowel, live mic only).
-    #[test]
-    fn expander_floor_preserves_breath() {
-        let mut e = SoftExpander::new(16_000.0);
-        // Closed expander: quiet breath noise must survive at the floor,
-        // never hit zero.
-        let mut c = vec![0.01f32; 3_840];
-        e.process(&mut c, false);
-        let min = c.iter().fold(f32::MAX, |m, &v| m.min(v));
-        assert!(min > 0.0009, "breath was muted: min {min}");
-        assert!(c[3_839] <= 0.01 * SoftExpander::FLOOR * 1.05);
-    }
-
-    #[test]
-    fn expander_opens_fast_closes_slow() {
-        let mut e = SoftExpander::new(16_000.0);
-        let mut c = vec![0.1f32; 3_840];
-        e.process(&mut c, true);
-        // Open: essentially unity within ~40 ms (5 time constants).
-        assert!(c[640] > 0.098, "opened too slowly: {}", c[640]);
-        // Close: after ONE 240 ms chunk the gain must still be well
-        // above the floor (slow release keeps word tails alive).
-        let mut c2 = vec![0.1f32; 3_840];
-        e.process(&mut c2, false);
-        assert!(
-            c2[3_839] > 0.1 * SoftExpander::FLOOR * 2.0,
-            "closed too fast: {}",
-            c2[3_839]
-        );
-        // Gain is continuous across the chunk boundary.
-        assert!((c2[0] - 0.1).abs() < 0.002, "boundary step: {}", c2[0]);
-    }
-
-    #[test]
-    fn output_leveler_reaches_target_without_steps() {
-        let mut lv = OutputLeveler::new();
-        // Quiet speech-like chunks (rms 0.04) must be brought up toward
-        // the target without inter-chunk level steps.
-        let mut last_tail = None::<f32>;
-        let mut final_rms = 0.0;
-        for _ in 0..60 {
-            let mut c: Vec<f32> = (0..3_840)
-                .map(|i| 0.0566 * (2.0 * std::f32::consts::PI * 300.0 * i as f32 / 16_000.0).sin())
-                .collect();
-            let head = c[0];
-            lv.process(&mut c);
-            if let Some(t) = last_tail {
-                // Boundary continuity: applied gain carries across chunks.
-                let expected = head * lv.applied / lv.gain.max(1e-6);
-                let _ = expected;
-                assert!((c[0] - head * t / 1.0).abs() < 0.05, "boundary step");
-            }
-            last_tail = Some(lv.applied);
-            final_rms = (c.iter().map(|s| s * s).sum::<f32>() / c.len() as f32).sqrt();
-        }
-        assert!(
-            (final_rms - OutputLeveler::TARGET_RMS).abs() < 0.02,
-            "did not level: rms {final_rms}"
-        );
-    }
-
-    #[test]
-    fn normalizer_gain_ramps_across_chunks() {
-        let sr = SR as f64;
-        let sig: Vec<f64> = (0..8 * SR)
-            .map(|i| 0.6 * (2.0 * std::f64::consts::PI * 220.0 * i as f64 / sr).sin())
-            .collect();
-        let mut norm = MicVolumeNormalizer::new();
-        let mut out = sig.clone();
-        for c in out.chunks_mut(CHUNK_SAMPLES) {
-            norm.process(c);
-        }
-        // Max adjacent-sample jump of the normalized tone must stay close
-        // to the tone's own slope bound (2*pi*f/sr * amp * max_gain_local),
-        // i.e. no additional boundary steps.
-        let mut max_ratio = 0f64;
-        for w in out.windows(2) {
-            let d = (w[1] - w[0]).abs();
-            max_ratio = max_ratio.max(d);
-        }
-        // Tone slope bound with the converged gain (<= ~0.42 for 220 Hz):
-        // allow 20% headroom; a per-chunk gain step of a few percent on a
-        // 0.6 amplitude tone would exceed this immediately.
-        let slope = 2.0 * std::f64::consts::PI * 220.0 / sr;
-        let bound = out.iter().fold(0f64, |m, &v| m.max(v.abs())) * slope * 1.2 + 1e-6;
-        assert!(
-            max_ratio < bound,
-            "boundary level step detected: {max_ratio} vs slope bound {bound}"
-        );
-    }
-}
-
 /// Voice print: an explicitly passed safetensors file, otherwise (feature
 /// "wavlm") computed natively FROM THE REFERENCE AUDIO via the ONNX
 /// WavLM-Large SV model at ckpt/wavlm_sv.onnx. There is deliberately no
@@ -903,26 +658,6 @@ fn xvc_device(force_cpu: bool) -> Device {
 #[cfg(not(feature = "cuda"))]
 fn xvc_device(_force_cpu: bool) -> Device {
     Device::Cpu
-}
-
-/// Capture spec: the engines consume 16 kHz input.
-fn pulse_spec() -> Spec {
-    Spec {
-        format: Format::FLOAT32NE,
-        channels: 1,
-        rate: SR as u32,
-    }
-}
-
-/// Playback spec: the output path upsamples to 48 kHz in-process
-/// (issue #42), so the sink stream opens at 48 kHz and PipeWire never
-/// resamples the converted voice itself.
-fn pulse_spec_out() -> Spec {
-    Spec {
-        format: Format::FLOAT32NE,
-        channels: 1,
-        rate: OUT_SR as u32,
-    }
 }
 
 /// Message to the output thread: a mel chunk to vocode (MeanVC) or
@@ -1459,27 +1194,42 @@ fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("cannot install the signal handler: {e}"))?;
     }
 
+    // Platform audio backend (issue #52): Pulse null-sink virtual mic on
+    // Linux, cpal + loopback-device routing on Windows/macOS.
+    let backend = audio::default_backend(audio::BackendOptions {
+        output_device: args.output_device.clone(),
+    });
     // Belt-and-braces: recover devices leaked by a previous run that was
     // killed before teardown, before creating fresh ones.
     if !args.no_sink || (args.denoise && args.wav.is_none()) {
-        recover_stale_modules();
+        backend.recover_stale();
     }
-    let mut modules = if args.no_sink {
-        Vec::new()
+    let sink_status = if args.no_sink {
+        None
     } else {
-        create_virtual_device()?
+        Some(backend.create_virtual_mic()?)
     };
-    let sink_ok = !modules.is_empty();
-    // Optional noise suppression in front of the mic.
+    let sink_ok = sink_status.is_some();
+    // Optional OS-level noise suppression in front of the mic.
     let capture_device: Option<String> = if args.denoise && args.wav.is_none() {
-        modules.push(create_denoiser(args.input_device.as_deref())?);
-        Some(DENOISED_SRC.to_string())
+        match backend.create_denoised_source(args.input_device.as_deref())? {
+            Some(src) => Some(src),
+            None => {
+                eprintln!(
+                    "--denoise: no OS-level denoiser on this platform ({}); \
+                     the in-process RNNoise stage stays active instead — \
+                     set it with --denoise-mix <0-100> or the , / . knob",
+                    backend.name()
+                );
+                args.input_device.clone()
+            }
+        }
     } else {
         args.input_device.clone()
     };
-    let monitor = Arc::new(Monitor(Mutex::new(None)));
+    let mut monitoring = false;
     if args.monitor && sink_ok {
-        monitor.toggle()?;
+        monitoring = backend.toggle_monitor()?;
     }
 
     let controls = Arc::new(Controls {
@@ -1490,13 +1240,9 @@ fn main() -> anyhow::Result<()> {
         gate_db: AtomicI32::new(args.gate_db),
     });
     let stats = Arc::new(Mutex::new(Stats {
-        status: if sink_ok {
-            format!(
-                "virtual mic \"{VIRT_MIC}\" is live — select \"Babiniku-Virtual-Mic\" in your app"
-            )
-        } else {
-            "virtual sink disabled (--no-sink)".into()
-        },
+        status: sink_status
+            .clone()
+            .unwrap_or_else(|| "virtual sink disabled (--no-sink)".into()),
         ..Default::default()
     }));
 
@@ -1523,6 +1269,7 @@ fn main() -> anyhow::Result<()> {
     let run_in = run.clone();
     let capture_device = capture_device.clone();
     let controls_in = controls.clone();
+    let backend_in = backend.clone();
     let hop_ms = chunk_samples as u64 * 1000 / SR as u64;
     let input = std::thread::spawn(move || -> anyhow::Result<()> {
         let mut rnnoise = Rnnoise16k::new();
@@ -1562,39 +1309,15 @@ fn main() -> anyhow::Result<()> {
                 Ok(())
             }
             None => {
-                let s = Simple::new(
-                    None,
-                    "babiniku-demo",
-                    Direction::Record,
-                    capture_device.as_deref(),
-                    "capture",
-                    &pulse_spec(),
-                    None,
-                    // Generous capture buffering: a transient pipeline
-                    // stall (GPU hiccup, scheduler burp) back-pressures the
-                    // input thread; with the default fragsize the server
-                    // then drops mic samples, splicing a discontinuity
-                    // into the INPUT that converts into an audible tick
-                    // (issue #42 third field recording: mid-level clicks
-                    // with 0.27 sample steps, no clipping, live only).
-                    // 2 s of slack absorbs any realistic stall.
-                    Some(&libpulse_binding::def::BufferAttr {
-                        maxlength: SR as u32 * 4 * 2, // 2 s of f32 mono
-                        tlength: u32::MAX,
-                        prebuf: u32::MAX,
-                        minreq: u32::MAX,
-                        fragsize: (chunk_samples * 4) as u32,
-                    }),
-                )
-                .map_err(|e| anyhow::anyhow!("pulse record: {e}"))?;
-                let mut buf = vec![0u8; chunk_samples * 4];
+                // The backend provides blocking 16 kHz mono capture with
+                // generous transport buffering (the issue #42 stall
+                // headroom lives in the backend implementations).
+                let mut cap =
+                    backend_in.open_capture(capture_device.as_deref(), SR as u32, chunk_samples)?;
+                let mut buf = vec![0f32; chunk_samples];
                 while run_in.load(Ordering::Relaxed) {
-                    s.read(&mut buf).map_err(|e| anyhow::anyhow!("read: {e}"))?;
-                    let c: Vec<f32> = buf
-                        .chunks_exact(4)
-                        .map(|b| f32::from_ne_bytes([b[0], b[1], b[2], b[3]]))
-                        .collect();
-                    if tx_in.send(denoise_chunk(c)).is_err() {
+                    cap.read(&mut buf)?;
+                    if tx_in.send(denoise_chunk(buf.clone())).is_err() {
                         break;
                     }
                 }
@@ -1610,6 +1333,7 @@ fn main() -> anyhow::Result<()> {
     let out_path = args.out.clone();
     let stats_out = stats.clone();
     let controls_out = controls.clone();
+    let backend_out = backend.clone();
     let output = std::thread::spawn(move || -> anyhow::Result<()> {
         let mut stretch = Stretch::preset_default(1, SR as u32);
         let mut current_semi = 0f32;
@@ -1627,20 +1351,10 @@ fn main() -> anyhow::Result<()> {
         let mut limiter = vc_core::bwe::Limiter::new(OUT_SR as f32, 0.90);
         let mut leveler = OutputLeveler::new();
         let mut chunk48: Vec<f32> = Vec::new();
-        let play = if sink_ok {
-            Some(
-                Simple::new(
-                    None,
-                    "babiniku-demo",
-                    Direction::Playback,
-                    Some(SINK),
-                    "converted",
-                    &pulse_spec_out(),
-                    None,
-                    None,
-                )
-                .map_err(|e| anyhow::anyhow!("pulse playback: {e}"))?,
-            )
+        // Playback opens at 48 kHz into the virtual-mic route so the OS
+        // never resamples the converted voice itself (issue #42).
+        let mut play = if sink_ok {
+            Some(backend_out.open_playback(OUT_SR as u32)?)
         } else {
             None
         };
@@ -1667,13 +1381,15 @@ fn main() -> anyhow::Result<()> {
                 let mut c48 = c.clone();
                 // Output NR before the leveler, so the diffusion noise
                 // bed is scrubbed instead of boosted.
-                let odn =
-                    controls_out.out_denoise.load(Ordering::Relaxed).clamp(0, 100) as f32 / 100.0;
+                let odn = controls_out
+                    .out_denoise
+                    .load(Ordering::Relaxed)
+                    .clamp(0, 100) as f32
+                    / 100.0;
                 rnnoise48.process(&mut c48, odn);
                 // Pitch shift at the output rate (same knob semantics as
                 // the 16 kHz path; bypassed at 0 to avoid its latency).
-                let semi =
-                    controls_out.pitch_decisemitones.load(Ordering::Relaxed) as f32 / 10.0;
+                let semi = controls_out.pitch_decisemitones.load(Ordering::Relaxed) as f32 / 10.0;
                 if semi.abs() > 0.05 {
                     if (semi - current_semi48).abs() > 0.01 {
                         stretch48
@@ -1685,17 +1401,17 @@ fn main() -> anyhow::Result<()> {
                     c48 = shifted;
                 }
                 leveler.process(&mut c48);
-                let wet =
-                    controls_out.bwe_wet.load(Ordering::Relaxed).clamp(0, 100) as f32 / 100.0;
+                let wet = controls_out.bwe_wet.load(Ordering::Relaxed).clamp(0, 100) as f32 / 100.0;
                 exciter.process(&mut c48, wet);
                 limiter.process(&mut c48);
                 {
                     let mut st = stats_out.lock().unwrap();
                     st.out_rms = rms(&c48);
                 }
-                if let Some(p) = &play {
-                    let bytes: Vec<u8> = c48.iter().flat_map(|s| s.to_ne_bytes()).collect();
-                    p.write(&bytes).map_err(|e| anyhow::anyhow!("write: {e}"))?;
+                // Same 48 kHz playback stream into the virtual-mic
+                // route as the upsampled engines (issue #52 rebase).
+                if let Some(p) = play.as_mut() {
+                    p.write(&c48)?;
                 }
                 if let Some(w) = writer.as_mut() {
                     for s in &c48 {
@@ -1771,9 +1487,8 @@ fn main() -> anyhow::Result<()> {
             let wet = controls_out.bwe_wet.load(Ordering::Relaxed).clamp(0, 100) as f32 / 100.0;
             exciter.process(&mut chunk48, wet);
             limiter.process(&mut chunk48);
-            if let Some(p) = &play {
-                let bytes: Vec<u8> = chunk48.iter().flat_map(|s| s.to_ne_bytes()).collect();
-                p.write(&bytes).map_err(|e| anyhow::anyhow!("write: {e}"))?;
+            if let Some(p) = play.as_mut() {
+                p.write(&chunk48)?;
             }
             if let Some(w) = writer.as_mut() {
                 for s in &chunk48 {
@@ -2007,7 +1722,8 @@ fn main() -> anyhow::Result<()> {
             engine,
             stats.clone(),
             run.clone(),
-            monitor.clone(),
+            backend.clone(),
+            monitoring,
             controls.clone(),
             sink_ok,
             args.duration,
@@ -2020,17 +1736,19 @@ fn main() -> anyhow::Result<()> {
             eprintln!("thread error: {e}");
         }
     }
-    monitor.off();
-    destroy_virtual_device(&modules);
+    backend.monitor_off();
+    backend.destroy_virtual_mic();
     eprintln!("virtual device removed, bye");
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_tui(
     engine: EngineKind,
     stats: Arc<Mutex<Stats>>,
     run: Arc<AtomicBool>,
-    monitor: Arc<Monitor>,
+    backend: Arc<dyn AudioBackend>,
+    monitoring_initial: bool,
     controls: Arc<Controls>,
     sink_ok: bool,
     duration: Option<f32>,
@@ -2041,10 +1759,7 @@ fn run_tui(
 
     let mut terminal = ratatui::init();
     let started = Instant::now();
-    let mut monitoring = {
-        let m = monitor.0.lock().unwrap();
-        m.is_some()
-    };
+    let mut monitoring = monitoring_initial;
     while run.load(Ordering::Relaxed) {
         if let Some(d) = duration {
             if started.elapsed().as_secs_f32() >= d {
@@ -2183,7 +1898,7 @@ fn run_tui(
                         st.passthrough = !st.passthrough;
                     }
                     KeyCode::Char('l') if sink_ok => {
-                        monitoring = monitor.toggle().unwrap_or(monitoring);
+                        monitoring = backend.toggle_monitor().unwrap_or(monitoring);
                     }
                     KeyCode::Char('[') => {
                         let v = controls.pitch_decisemitones.load(Ordering::Relaxed);
@@ -2248,33 +1963,99 @@ fn run_tui(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::stale_babiniku_modules;
+mod norm_tests {
+    use super::*;
 
-    /// A realistic `pactl list modules short` listing: the four modules a
-    /// killed demo leaks, plus lookalikes that must be left alone.
-    const LISTING: &str = "\
-5\tmodule-native-protocol-unix\t
-21\tmodule-null-sink\tsink_name=babiniku sink_properties=device.description=Babiniku-Output
-22\tmodule-remap-source\tsource_name=babiniku_mic master=babiniku.monitor source_properties=device.description=Babiniku-Virtual-Mic
-23\tmodule-loopback\tsource=babiniku.monitor latency_msec=60
-24\tmodule-echo-cancel\tsource_name=babiniku_denoised aec_method=webrtc source_properties=device.description=Babiniku-Denoised-Input
-25\tmodule-null-sink\tsink_name=babiniku2
-26\tmodule-null-sink\tsink_name=other sink_properties=device.description=babiniku
-";
-
+    /// Chunked processing of a steady tone must not introduce level steps
+    /// at chunk boundaries while the gain estimate adapts (issue #42
+    /// field report: ticks during a sustained vowel, live mic only).
     #[test]
-    fn finds_exactly_the_leaked_babiniku_modules() {
-        let stale = stale_babiniku_modules(LISTING);
-        let ids: Vec<&str> = stale.iter().map(|(id, _)| id.as_str()).collect();
-        assert_eq!(ids, ["21", "22", "23", "24"]);
-        assert_eq!(stale[0].1, "module-null-sink");
-        assert_eq!(stale[2].1, "module-loopback");
+    fn expander_floor_preserves_breath() {
+        let mut e = SoftExpander::new(16_000.0);
+        // Closed expander: quiet breath noise must survive at the floor,
+        // never hit zero.
+        let mut c = vec![0.01f32; 3_840];
+        e.process(&mut c, false);
+        let min = c.iter().fold(f32::MAX, |m, &v| m.min(v));
+        assert!(min > 0.0009, "breath was muted: min {min}");
+        assert!(c[3_839] <= 0.01 * SoftExpander::FLOOR * 1.05);
     }
 
     #[test]
-    fn empty_or_malformed_listings_match_nothing() {
-        assert!(stale_babiniku_modules("").is_empty());
-        assert!(stale_babiniku_modules("garbage without tabs\n\n").is_empty());
+    fn expander_opens_fast_closes_slow() {
+        let mut e = SoftExpander::new(16_000.0);
+        let mut c = vec![0.1f32; 3_840];
+        e.process(&mut c, true);
+        // Open: essentially unity within ~40 ms (5 time constants).
+        assert!(c[640] > 0.098, "opened too slowly: {}", c[640]);
+        // Close: after ONE 240 ms chunk the gain must still be well
+        // above the floor (slow release keeps word tails alive).
+        let mut c2 = vec![0.1f32; 3_840];
+        e.process(&mut c2, false);
+        assert!(
+            c2[3_839] > 0.1 * SoftExpander::FLOOR * 2.0,
+            "closed too fast: {}",
+            c2[3_839]
+        );
+        // Gain is continuous across the chunk boundary.
+        assert!((c2[0] - 0.1).abs() < 0.002, "boundary step: {}", c2[0]);
+    }
+
+    #[test]
+    fn output_leveler_reaches_target_without_steps() {
+        let mut lv = OutputLeveler::new();
+        // Quiet speech-like chunks (rms 0.04) must be brought up toward
+        // the target without inter-chunk level steps.
+        let mut last_tail = None::<f32>;
+        let mut final_rms = 0.0;
+        for _ in 0..60 {
+            let mut c: Vec<f32> = (0..3_840)
+                .map(|i| 0.0566 * (2.0 * std::f32::consts::PI * 300.0 * i as f32 / 16_000.0).sin())
+                .collect();
+            let head = c[0];
+            lv.process(&mut c);
+            if let Some(t) = last_tail {
+                // Boundary continuity: applied gain carries across chunks.
+                let expected = head * lv.applied / lv.gain.max(1e-6);
+                let _ = expected;
+                assert!((c[0] - head * t / 1.0).abs() < 0.05, "boundary step");
+            }
+            last_tail = Some(lv.applied);
+            final_rms = (c.iter().map(|s| s * s).sum::<f32>() / c.len() as f32).sqrt();
+        }
+        assert!(
+            (final_rms - OutputLeveler::TARGET_RMS).abs() < 0.02,
+            "did not level: rms {final_rms}"
+        );
+    }
+
+    #[test]
+    fn normalizer_gain_ramps_across_chunks() {
+        let sr = SR as f64;
+        let sig: Vec<f64> = (0..8 * SR)
+            .map(|i| 0.6 * (2.0 * std::f64::consts::PI * 220.0 * i as f64 / sr).sin())
+            .collect();
+        let mut norm = MicVolumeNormalizer::new();
+        let mut out = sig.clone();
+        for c in out.chunks_mut(CHUNK_SAMPLES) {
+            norm.process(c);
+        }
+        // Max adjacent-sample jump of the normalized tone must stay close
+        // to the tone's own slope bound (2*pi*f/sr * amp * max_gain_local),
+        // i.e. no additional boundary steps.
+        let mut max_ratio = 0f64;
+        for w in out.windows(2) {
+            let d = (w[1] - w[0]).abs();
+            max_ratio = max_ratio.max(d);
+        }
+        // Tone slope bound with the converged gain (<= ~0.42 for 220 Hz):
+        // allow 20% headroom; a per-chunk gain step of a few percent on a
+        // 0.6 amplitude tone would exceed this immediately.
+        let slope = 2.0 * std::f64::consts::PI * 220.0 / sr;
+        let bound = out.iter().fold(0f64, |m, &v| m.max(v.abs())) * slope * 1.2 + 1e-6;
+        assert!(
+            max_ratio < bound,
+            "boundary level step detected: {max_ratio} vs slope bound {bound}"
+        );
     }
 }

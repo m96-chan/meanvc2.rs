@@ -51,6 +51,23 @@ engine and its per-stage RTF.
 
 Every engine is ported weight-compatible and verified stage-by-stage against its official implementation with golden tests (`cargo test --workspace`). Deep dive, APIs, checkpoint setup, performance notes: [docs/meanvc.md](docs/meanvc.md). Issues are labeled by architecture (`meanvc`, `meanvc2`, `demo`, `infra`).
 
+## Platform support
+
+The engine core is pure Rust and portable; the platform surface — capture/playback and the **virtual microphone** — lives behind an audio backend layer in `crates/vc-demo` ([#51](https://github.com/m96-chan/babiniku.rs/issues/51), [#52](https://github.com/m96-chan/babiniku.rs/issues/52)).
+
+| Platform | Capture / playback | Virtual mic | Status |
+|---|---|---|---|
+| Linux | PulseAudio/PipeWire | ✅ null sink + remap (`babiniku_mic`) | ✅ working |
+| Windows | WASAPI (`cpal`) | routed to VB-CABLE / VoiceMeeter (auto-detected or `--output-device`) | 🔬 build- & unit-verified, live verification in [#53](https://github.com/m96-chan/babiniku.rs/issues/53) |
+| macOS | CoreAudio (`cpal`) | routed to BlackHole (auto-detected or `--output-device`) | 🔬 build- & unit-verified, live verification in [#54](https://github.com/m96-chan/babiniku.rs/issues/54) |
+| Android / iOS | AAudio / AVAudioEngine | in-app routing (library-first) | 📋 planned ([#56](https://github.com/m96-chan/babiniku.rs/issues/56) / [#57](https://github.com/m96-chan/babiniku.rs/issues/57)) |
+
+Verify a platform's audio stack in seconds — no model checkpoints needed (lists devices, creates the virtual-mic route, plays a tone through it, captures 1 s of mic audio, tears down):
+
+```sh
+cargo run --release -p vc-demo --example audio_probe
+```
+
 ## Workspace layout
 
 The repo is a cargo workspace — one crate per engine on a shared foundation:
@@ -59,7 +76,7 @@ The repo is a cargo workspace — one crate per engine on a shared foundation:
 |---|---|
 | [`crates/vc-core`](crates/vc-core) | Engine-agnostic foundation: encoder/speaker/vocoder traits, log-mel front-end, BWE post-processing (`bwe::Upsampler3x`, `bwe::Exciter`), `Error`/`Result` |
 | [`crates/meanvc`](crates/meanvc) | MeanVC v1 + MeanVC 2 engines (library name `meanvc2`), examples, golden tests |
-| [`crates/vc-demo`](crates/vc-demo) | The `babiniku-demo` real-time TUI / virtual-mic binary |
+| [`crates/vc-demo`](crates/vc-demo) | The `babiniku-demo` real-time TUI / virtual-mic binary, plus the per-platform audio backends (`vc_demo::audio`: Pulse on Linux, cpal/WASAPI/CoreAudio elsewhere) and the `audio_probe` example |
 | [`crates/xvc`](crates/xvc) | X-VC engine: GLM-4-Voice tokenizer, ERes2Net, SAC codec, prenet, MMDiT converter + the `XvcEngine` offline/streaming pipeline ([#30](https://github.com/m96-chan/babiniku.rs/issues/30)) |
 
 Checkpoints stay at the repo root (`ckpt/`), as do `tools/` and `docs/`.
