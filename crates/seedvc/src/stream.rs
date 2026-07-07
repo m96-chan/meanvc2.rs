@@ -11,7 +11,7 @@
 
 use candle_core::{Device, Tensor};
 
-use crate::pipeline::{resample, SeedVcEngine};
+use crate::pipeline::{resample, resample_width, SeedVcEngine};
 use crate::Result;
 
 /// Streaming parameters (16 kHz sample units where applicable).
@@ -77,6 +77,12 @@ pub struct SeedVcStream<'a> {
     /// via candle's seeded device RNG would break CUDA/CPU parity, so
     /// the stream carries its own tiny xorshift for reproducibility).
     rng: u64,
+    /// Fixed CFM noise, cached per shape: consecutive hops share most
+    /// of their window, and sampling them from the SAME noise field
+    /// makes the overlap render consistently — fresh noise per hop
+    /// decorrelates the texture at every block joint (audible as a
+    /// faint gritty shimmer, field report 2026-07).
+    noise_cache: Option<Tensor>,
 }
 
 impl SeedVcEngine {
@@ -108,6 +114,7 @@ impl SeedVcEngine {
             pending: 0,
             tail: Vec::new(),
             rng: 0x5eed_5eed_5eed_5eed,
+            noise_cache: None,
         })
     }
 }
@@ -178,7 +185,15 @@ impl SeedVcStream<'_> {
         let cond = self.engine.regulate(&s_short, t_win)?;
         let cat = Tensor::cat(&[&self.reference.prompt_condition, &cond], 1)?;
         let t_ref = self.reference.ref_mel_frames;
-        let noise = self.next_noise((1, 80, t_ref + t_win), cat.device())?;
+        let want = (1, 80, t_ref + t_win);
+        let noise = match &self.noise_cache {
+            Some(n) if n.dims3()? == want => n.clone(),
+            _ => {
+                let n = self.next_noise(want, cat.device())?;
+                self.noise_cache = Some(n.clone());
+                n
+            }
+        };
         let vc_mel = self.engine.cfm_inference(
             &cat,
             &self.reference.mel2,
@@ -218,6 +233,6 @@ impl SeedVcStream<'_> {
         let emitted: Vec<f32> = out22[..block22].to_vec();
         self.tail = out22[block22..].to_vec();
 
-        Ok(Some(resample(&emitted, 22_050, 48_000)))
+        Ok(Some(resample_width(&emitted, 22_050, 48_000, 16)))
     }
 }

@@ -12,10 +12,16 @@ use crate::{bigvgan::BigVgan, campplus::CampPlus, campplus::FbankExtractor, dit:
 /// rolloff 0.99) — the resampler used by the official pipeline for
 /// 22 050 → 16 000.
 pub fn resample(input: &[f32], orig: usize, new: usize) -> Vec<f32> {
+    resample_width(input, orig, new, 6)
+}
+
+/// Like [`resample`] with an explicit low-pass filter width: 6 matches
+/// torchaudio's default (used for parity on the input side); the
+/// 22 050 → 48 000 output hop uses 16 for a cleaner image rejection.
+pub fn resample_width(input: &[f32], orig: usize, new: usize, width: usize) -> Vec<f32> {
     let g = gcd(orig, new);
     let (orig_f, new_f) = (orig / g, new / g);
     let rolloff = 0.99f64;
-    let width = 6usize;
     let base = rolloff * (orig_f.min(new_f) as f64);
     let kw = (width as f64 * orig_f as f64 / base).ceil() as i64;
     let scale = base / orig_f as f64;
