@@ -28,3 +28,4 @@ pub mod campplus;
 pub mod dit;
 pub mod mel;
 pub mod regulator;
+pub mod whisper;
