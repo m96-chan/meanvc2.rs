@@ -22,11 +22,15 @@
 //! - only contiguous runs up to 2.5 ms are repaired; anything longer is
 //!   real audio by definition and is left alone.
 //!
-//! Repair ATTENUATES the run to the local level with a tapered gain
-//! dip (the eighth field recording pinned audible ticks to the earlier
-//! linear-bridge repair: excising through quiet breathy content leaves
-//! a notch that is itself a tick; a gain dip keeps the waveform
-//! continuous, and a false positive merely softens a transient).
+//! Repair is MATCHED SUBTRACTION: the underlying voice across the run
+//! is estimated with a C1 cubic Hermite spline anchored on the samples
+//! just outside the run (values AND slopes match at both ends), and the
+//! run is replaced by that estimate — equivalently, the needle component
+//! (actual − smooth) is phase-cancelled exactly, per event. Earlier
+//! repairs were audible themselves: a linear bridge notches quiet
+//! content (eighth recording), and even a tapered gain dip dents the
+//! voice's level trajectory enough to read as a soft knock (ninth/tenth
+//! recordings). The spline follows the voice, so nothing is dented.
 //!
 //! The suppressor is streaming: [`NeedleGuard::process`] consumes a
 //! chunk and returns the same number of samples delayed by the context
@@ -52,10 +56,13 @@ pub struct NeedleGuard {
 /// (sixth field recording); 0.10 catches those while staying above any
 /// plausible noise-floor content.
 const ABS_FLOOR: f32 = 0.10;
-/// Candidate threshold as a multiple of the local median |y|. Natural
-/// glottal peaks in converted speech stay under ~5x their local median;
-/// field-recording needles measure 6.2–8x.
-const RATIO: f32 = 6.0;
+/// Candidate threshold as a multiple of the local median |y|.
+/// Field-recording needles measure 3.4–8x (report 14 pinned the
+/// surviving っ/word-ending class at 3.4–6.6x); natural glottal peaks
+/// also reach 4–5x, but they are periodic — the widened isolation
+/// window sees their neighbours and rejects them structurally, so the
+/// ratio can sit below glottal-peak territory.
+const RATIO: f32 = 4.5;
 /// Floor for the local median, so a silent context (median ≈ 0, e.g.
 /// right after the input gate opens) cannot make every voiced sample
 /// look like an infinite-ratio needle.
@@ -78,9 +85,10 @@ const LOUD_NEEDLE: f32 = 0.25;
 const MARGIN: usize = 16;
 /// Isolation context checked on both sides of a run (seconds): a needle
 /// is a lone pulse, so its neighbourhood stays well below the run peak.
-/// Speech onsets fail this check — the next glottal cycle follows at a
-/// comparable amplitude within 2 ms — and are left untouched.
-const ISO_SECS: f32 = 0.002;
+/// 4 ms covers one glottal period down to ~250 Hz, so periodic pulses
+/// (voiced speech, onsets) always see a comparable neighbour and are
+/// left untouched — this is what lets RATIO sit at 4.5.
+const ISO_SECS: f32 = 0.004;
 /// Neighbourhood-to-peak bound for the isolation check.
 const ISO_RATIO: f32 = 0.65;
 
@@ -90,12 +98,12 @@ impl NeedleGuard {
     pub fn new(sample_rate: f32) -> Self {
         Self {
             ctx: (0.008 * sample_rate) as usize,
-            // Action is restricted to needle-width runs (≤ 0.5 ms): the
-            // decoder needle is a 3–5 sample pulse at 16 kHz, while
-            // breath/consonant transients — the guard's false-positive
-            // class in quiet passages, audible as soft knocks when
-            // touched — are broader and now pass untouched.
-            max_run: (0.0005 * sample_rate) as usize,
+            // Action is restricted to needle-width runs (≤ 0.8 ms):
+            // field needles measure up to ~0.6 ms pre-BWE (report 14 —
+            // the 0.5 ms cap left their skirts unrepaired, audible as
+            // residual knocks), while breath/consonant transients are
+            // ≥3 ms and pass untouched.
+            max_run: (0.0008 * sample_rate) as usize,
             iso: (ISO_SECS * sample_rate) as usize,
             buf: Vec::new(),
             repaired: 0,
@@ -241,22 +249,27 @@ mod tests {
 
     #[test]
     fn keeps_natural_glottal_peaks() {
-        // A sharp but natural pulse: 4x the local median is loud speech,
-        // not a needle.
+        // Natural sharp pulses are PERIODIC (one per glottal cycle):
+        // the isolation window sees their neighbours and must leave the
+        // whole train untouched, even at needle-like sharpness/ratio.
         let mut x = vowel(16_000);
         let med: f32 = {
             let mut m: Vec<f32> = x.iter().map(|s| s.abs()).collect();
             m.sort_by(|a, b| a.total_cmp(b));
             m[m.len() / 2]
         };
-        for k in 0..12 {
-            x[8_000 + k] += 3.5 * med * (std::f32::consts::PI * k as f32 / 12.0).sin();
+        let period = 16_000 / 300; // one pulse per 300 Hz glottal cycle
+        for p0 in (6_000..10_000).step_by(period) {
+            for k in 0..12 {
+                x[p0 + k] += 3.5 * med * (std::f32::consts::PI * k as f32 / 12.0).sin();
+            }
         }
         let expected = x.clone();
         let mut g = NeedleGuard::new(16_000.0);
         let y = g.process(&x);
         let d = g.latency();
-        for i in 7_900..8_100 {
+        assert_eq!(g.repaired, 0, "periodic pulse train was repaired");
+        for i in 6_500..9_500 {
             assert_eq!(y[i + d], expected[i], "natural pulse modified at {i}");
         }
     }

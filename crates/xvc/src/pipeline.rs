@@ -784,12 +784,21 @@ fn cross_check_repair(held: &mut [f32], other: &[f32]) -> u32 {
         return 0;
     }
     let max_run = (XCHK_MAX_RUN_SECS * SAMPLE_RATE as f32) as usize;
-    // Divergence threshold: well above the typical re-rendering
-    // difference of THIS hop (median is immune to the short needle).
-    let mut mag: Vec<f32> = held.iter().zip(other).map(|(a, b)| (a - b).abs()).collect();
-    let mid = mag.len() / 2;
-    mag.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
-    let thr = (4.0 * mag[mid]).max(XCHK_DIV_FLOOR);
+    // Work in the DIFFERENCE domain: the shared voice cancels in
+    // d = held − other, so a needle riding loud speech — invisible to
+    // amplitude heuristics on the audio itself (median-ratio 5–6, right
+    // in natural-glottal-peak territory, field report 13) — stands
+    // naked as a spike over d's own local statistics.
+    let d: Vec<f32> = held.iter().zip(other).map(|(a, b)| (a - b).abs()).collect();
+    let ctx = (0.008 * SAMPLE_RATE as f32) as usize;
+    let local_med = |c: usize| -> f32 {
+        let lo = c.saturating_sub(ctx);
+        let hi = (c + ctx + 1).min(d.len());
+        let mut m: Vec<f32> = d[lo..hi].to_vec();
+        let mid = m.len() / 2;
+        m.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
+        m[mid]
+    };
 
     let sharpness = |x: &[f32], lo: usize, hi: usize| -> f32 {
         let lo = lo.saturating_sub(XCHK_MARGIN);
@@ -803,12 +812,21 @@ fn cross_check_repair(held: &mut [f32], other: &[f32]) -> u32 {
     let mut repairs = 0;
     let mut i = 0;
     while i < held.len() {
-        if (held[i] - other[i]).abs() <= thr {
+        if d[i] <= XCHK_DIV_FLOOR {
             i += 1;
             continue;
         }
+        let med = local_med(i).max(1e-4);
+        if d[i] <= 6.0 * med {
+            i += 1;
+            continue;
+        }
+        // Run growth relative to d's LOCAL ambient level, not the spike:
+        // in an unstable window the broadband divergence is elevated, and
+        // a spike-relative growth bound used to merge the needle into a
+        // long run that was then rejected as real audio.
         let mut j = i + 1;
-        while j < held.len() && j - i <= max_run && (held[j] - other[j]).abs() > 0.5 * thr {
+        while j < held.len() && j - i <= max_run && d[j] > 3.0 * med {
             j += 1;
         }
         if j - i <= max_run && sharpness(held, i, j) > XCHK_SHARPNESS * sharpness(other, i, j) {
@@ -1238,6 +1256,36 @@ mod tests {
         assert_eq!(repairs, 1);
         let peak = held[1_980..2_030].iter().fold(0f32, |m, s| m.max(s.abs()));
         assert!(peak < 0.4, "needle survived the cross-check: {peak}");
+    }
+
+    #[test]
+    fn cross_check_catches_riding_needle_in_unstable_window() {
+        // Field report 13: a needle riding LOUD speech inside a window
+        // whose two renderings already diverge broadly (decorrelated
+        // VQ noise). In the audio domain the needle is glottal-peak
+        // sized (invisible); in the difference domain it is a lone
+        // spike over d's local median and must be repaired.
+        let n = 3_840;
+        let f = 300.0 / SAMPLE_RATE as f32;
+        let mut rng = 0x5eedu32;
+        let mut noise = || {
+            rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((rng >> 16) as f32 / 65_536.0 - 0.5) * 0.02
+        };
+        let voice: Vec<f32> = (0..n)
+            .map(|i| 0.3 * (2.0 * std::f32::consts::PI * f * i as f32).sin())
+            .collect();
+        let mut held: Vec<f32> = voice.iter().map(|v| v + noise()).collect();
+        let other: Vec<f32> = voice.iter().map(|v| v + noise()).collect();
+        // Needle: +0.35 over a 0.3 voice — ratio ~2 vs the audio, huge
+        // vs the ~0.01 divergence floor.
+        held[2_000] += 0.20;
+        held[2_001] += 0.35;
+        held[2_002] += 0.22;
+        let repairs = cross_check_repair(&mut held, &other);
+        assert_eq!(repairs, 1, "riding needle not caught in d-domain");
+        let residual = (held[2_001] - voice[2_001]).abs();
+        assert!(residual < 0.06, "needle residual {residual}");
     }
 
     #[test]
