@@ -500,6 +500,44 @@ fn read_wav_16k(path: &str) -> anyhow::Result<Vec<f32>> {
 /// over a sliding window of the last few seconds and the gain is
 /// smoothed between chunks. Wav input bypasses this and uses the exact
 /// offline preprocessing instead.
+/// Downward expander in front of the conversion (issue #45): below the
+/// gate threshold the input is attenuated toward a floor instead of
+/// zeroed, so breaths, lip noise and word tails survive — quietly —
+/// and get CONVERTED (the binary gate deleted exactly the micro-sounds
+/// that make a voice read as a real person). Fast open, slow close,
+/// per-sample gain smoothing; state carries across chunks.
+struct SoftExpander {
+    gain: f32,
+    open_coeff: f32,
+    close_coeff: f32,
+}
+
+impl SoftExpander {
+    /// Attenuation floor for sub-threshold audio (−18 dB).
+    const FLOOR: f32 = 0.125;
+
+    fn new(sample_rate: f32) -> Self {
+        Self {
+            gain: Self::FLOOR,
+            open_coeff: 1.0 - (-1.0 / (0.008 * sample_rate)).exp(),
+            close_coeff: 1.0 - (-1.0 / (0.180 * sample_rate)).exp(),
+        }
+    }
+
+    fn process(&mut self, chunk: &mut [f32], open: bool) {
+        let target = if open { 1.0 } else { Self::FLOOR };
+        let coeff = if target > self.gain {
+            self.open_coeff
+        } else {
+            self.close_coeff
+        };
+        for s in chunk.iter_mut() {
+            self.gain += coeff * (target - self.gain);
+            *s *= self.gain;
+        }
+    }
+}
+
 /// Output loudness leveler (issue #42, VRChat report): the converted
 /// voice lands at whatever level the model chooses (~0.05 rms,
 /// reference-dependent) — too quiet for downstream apps. Speech-active
@@ -604,6 +642,38 @@ mod norm_tests {
     /// Chunked processing of a steady tone must not introduce level steps
     /// at chunk boundaries while the gain estimate adapts (issue #42
     /// field report: ticks during a sustained vowel, live mic only).
+    #[test]
+    fn expander_floor_preserves_breath() {
+        let mut e = SoftExpander::new(16_000.0);
+        // Closed expander: quiet breath noise must survive at the floor,
+        // never hit zero.
+        let mut c = vec![0.01f32; 3_840];
+        e.process(&mut c, false);
+        let min = c.iter().fold(f32::MAX, |m, &v| m.min(v));
+        assert!(min > 0.0009, "breath was muted: min {min}");
+        assert!(c[3_839] <= 0.01 * SoftExpander::FLOOR * 1.05);
+    }
+
+    #[test]
+    fn expander_opens_fast_closes_slow() {
+        let mut e = SoftExpander::new(16_000.0);
+        let mut c = vec![0.1f32; 3_840];
+        e.process(&mut c, true);
+        // Open: essentially unity within ~40 ms (5 time constants).
+        assert!(c[640] > 0.098, "opened too slowly: {}", c[640]);
+        // Close: after ONE 240 ms chunk the gain must still be well
+        // above the floor (slow release keeps word tails alive).
+        let mut c2 = vec![0.1f32; 3_840];
+        e.process(&mut c2, false);
+        assert!(
+            c2[3_839] > 0.1 * SoftExpander::FLOOR * 2.0,
+            "closed too fast: {}",
+            c2[3_839]
+        );
+        // Gain is continuous across the chunk boundary.
+        assert!((c2[0] - 0.1).abs() < 0.002, "boundary step: {}", c2[0]);
+    }
+
     #[test]
     fn output_leveler_reaches_target_without_steps() {
         let mut lv = OutputLeveler::new();
@@ -828,6 +898,8 @@ fn run_xvc_conversion(
     // drops, so word tails are not clipped.
     const HANGOVER: u32 = 2;
     let mut open_for = 0u32;
+    let mut deep_for = 0u32;
+    let mut expander = SoftExpander::new(SR as f32);
     let mut prev_gated = false;
     // Output schedule for the late counter: hop k is due at
     // `anchor + k·hop`, anchored on the first emitted hop.
@@ -918,23 +990,32 @@ fn run_xvc_conversion(
             // carry context across the bypassed audio.
             stream = xvc::XvcPipelinedStream::new(engine.clone(), reference.clone(), cfg)?;
             hp = HighpassBiquad::new(SR as f64, 40.0);
+            expander = SoftExpander::new(SR as f32);
             (anchor, emitted) = (None, 0);
             was_passthrough = false;
         }
 
-        // Input energy gate: silent windows skip the whole model forward
-        // (the converter hallucinates voiced murmurs on silence).
+        // Soft input gate (issue #45): above the knob threshold the
+        // expander is open (unity); below, the input is attenuated to
+        // −18 dB instead of zeroed, so breaths and word tails are
+        // CONVERTED. Only sustained deep silence (18 dB under the knob
+        // for ~1 s) is hard-zeroed — that keeps the all-zero window
+        // skip (CPU) and the anti-murmur guarantee for true silence.
         let gate = controls.gate_db.load(Ordering::Relaxed);
         let db = 20.0 * in_level.max(1e-9).log10();
         if db >= gate as f32 {
             open_for = HANGOVER + 1;
         }
         open_for = open_for.saturating_sub(1);
-        let gated = open_for == 0;
+        if db < gate as f32 - 18.0 {
+            deep_for += 1;
+        } else {
+            deep_for = 0;
+        }
+        const DEEP_CHUNKS: u32 = 4; // ~1 s of true silence
+        let gated = deep_for >= DEEP_CHUNKS;
 
-        let mut prepared: Vec<f32> = if gated {
-            vec![0.0; chunk.len()]
-        } else if mic_input {
+        let mut processed: Vec<f32> = if mic_input {
             let mut c64: Vec<f64> = chunk.iter().map(|&s| s as f64).collect();
             norm.process(&mut c64);
             hp.process(&mut c64);
@@ -942,17 +1023,23 @@ fn run_xvc_conversion(
         } else {
             chunk.clone()
         };
-        // Deterministic splice fades at gate transitions: the first gated
-        // chunk fades the real audio out (instead of a hard cut to zeros)
-        // and the first open chunk fades in — no blind discontinuity
-        // detection, so continuous audio is never touched.
+        expander.process(&mut processed, open_for > 0);
+        let mut prepared: Vec<f32> = if gated {
+            vec![0.0; chunk.len()]
+        } else {
+            processed.clone()
+        };
+        // Deterministic splice fades at hard-gate transitions: the first
+        // zeroed chunk fades the (expanded) audio out and the first
+        // reopened chunk fades in — no blind discontinuity detection,
+        // so continuous audio is never touched.
         const SPLICE_FADE: usize = 160; // 10 ms at 16 kHz
         if gated && !prev_gated {
             stats.lock().unwrap().declicks += 1;
-            let n = SPLICE_FADE.min(chunk.len());
+            let n = SPLICE_FADE.min(processed.len());
             for i in 0..n {
                 let w = 1.0 - i as f32 / n as f32;
-                prepared[i] = chunk[i] * w * w;
+                prepared[i] = processed[i] * w * w;
             }
         } else if !gated && prev_gated {
             let n = SPLICE_FADE.min(prepared.len());
