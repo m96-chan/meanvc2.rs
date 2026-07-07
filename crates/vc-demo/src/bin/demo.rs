@@ -2119,10 +2119,11 @@ fn run_tui(
             let mix = controls.denoise_mix.load(Ordering::Relaxed);
             let bwe = controls.bwe_wet.load(Ordering::Relaxed);
             let gate = controls.gate_db.load(Ordering::Relaxed);
+            let out_nr = controls.out_denoise.load(Ordering::Relaxed);
             let names = engine.stage_names();
             f.render_widget(
                 Paragraph::new(format!(
-                    "RTF  {} {:.2} · {} {:.2} · {} {:.2}\nchunks {} · late {} · gated {} · ng {} · sp {} · xr {} · mode {}\npitch {:+.1} st ([ / ])  ·  denoise mix {}% (, / .)  ·  gate {} dB (- / =)\nbwe exciter {}% (; / ')  ·  output 48 kHz  ·  {}",
+                    "RTF  {} {:.2} · {} {:.2} · {} {:.2}\nchunks {} · late {} · gated {} · ng {} · sp {} · xr {} · mode {}\npitch {:+.1} st ([ / ])  ·  denoise mix {}% (, / .)  ·  gate {} dB (- / =)\nbwe exciter {}% (; / ')  ·  out-nr {}% (< / >)  ·  output 48 kHz  ·  {}",
                     names[0],
                     snapshot.2,
                     names[1],
@@ -2140,6 +2141,7 @@ fn run_tui(
                     mix,
                     gate,
                     bwe,
+                    out_nr,
                     if snapshot.10.is_empty() {
                         "engine defaults"
                     } else {
