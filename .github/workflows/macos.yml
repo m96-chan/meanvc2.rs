@@ -1,0 +1,35 @@
+# macOS CI (#54): keep the demo crate building, testing and smoke-running
+# on Apple Silicon. CI runners have no loopback driver and no usable audio
+# devices, so the smoke run only exercises CoreAudio host init + device
+# enumeration (--no-sink --no-capture); the live route needs a real Mac.
+name: macOS
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  vc-demo:
+    # macos-latest is Apple Silicon (aarch64-apple-darwin).
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # CPU is the baseline (CLAUDE.md): release build + tests, no features.
+      - name: Build (release)
+        run: cargo build --release -p vc-demo
+
+      - name: Test
+        run: cargo test -p vc-demo
+
+      # The opt-in Metal GPU feature must keep compiling; a check is enough
+      # (no GPU on the runner, and CPU stays the supported baseline).
+      - name: Check the metal feature
+        run: cargo check -p vc-demo --features metal
+
+      # Headless audio smoke run: backend init + device enumeration only.
+      - name: Audio probe (headless)
+        run: cargo run --release -p vc-demo --example audio_probe -- --no-sink --no-capture
