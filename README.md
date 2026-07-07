@@ -59,7 +59,7 @@ The engine core is pure Rust and portable; the platform surface — capture/play
 |---|---|---|---|
 | Linux | PulseAudio/PipeWire | ✅ null sink + remap (`babiniku_mic`) | ✅ working |
 | [Windows](docs/windows.md) | WASAPI (`cpal`) | routed to VB-CABLE / VoiceMeeter (auto-detected or `--output-device`) | ✅ merged, CI-verified — live VB-CABLE routing awaiting field reports ([#53](https://github.com/m96-chan/babiniku.rs/issues/53)) |
-| [macOS](docs/macos.md) | CoreAudio (`cpal`) | routed to BlackHole (auto-detected or `--output-device`) | ⏳ implemented — verify on a real Mac ([#54](https://github.com/m96-chan/babiniku.rs/issues/54), PR pending) |
+| [macOS](docs/macos.md) | CoreAudio (`cpal`) | routed to BlackHole (auto-detected or `--output-device`) | ✅ merged, CI-verified — field reports welcome ([#54](https://github.com/m96-chan/babiniku.rs/issues/54)) |
 | Android / iOS | AAudio / AVAudioEngine | in-app routing (library-first) | 📋 planned ([#56](https://github.com/m96-chan/babiniku.rs/issues/56) / [#57](https://github.com/m96-chan/babiniku.rs/issues/57)) |
 
 Verify a platform's audio stack in seconds — no model checkpoints needed (lists devices, creates the virtual-mic route, plays a tone through it, captures 1 s of mic audio, tears down):
