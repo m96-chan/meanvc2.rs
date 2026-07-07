@@ -182,6 +182,12 @@ struct Args {
     /// latency is unaffected (only the history part grows). Default:
     /// 2400 (the official GPU preset) on CUDA, 640 on CPU.
     window_ms: Option<usize>,
+    /// X-VC hop override (ms). Smaller hops shrink both the audible
+    /// needle probability (the emitted slice is a smaller fraction of
+    /// the window) and the algorithmic latency, at proportionally more
+    /// compute. Default: 120 (the official GPU preset) on CUDA, 240 on
+    /// CPU.
+    hop_ms: Option<usize>,
     monitor: bool,
     denoise: bool,
     duration: Option<f32>,
@@ -205,6 +211,7 @@ fn parse_args() -> Args {
         no_sink: false,
         low_latency: false,
         window_ms: None,
+        hop_ms: None,
         monitor: false,
         denoise: false,
         duration: None,
@@ -237,6 +244,14 @@ fn parse_args() -> Args {
                         .expect("--window-ms <ms>")
                         .parse()
                         .expect("--window-ms takes an integer"),
+                )
+            }
+            "--hop-ms" => {
+                a.hop_ms = Some(
+                    it.next()
+                        .expect("--hop-ms <ms>")
+                        .parse()
+                        .expect("--hop-ms takes an integer"),
                 )
             }
             "--cpu" => a.cpu = true,
@@ -575,7 +590,10 @@ impl OutputLeveler {
             (chunk.iter().map(|s| s * s).sum::<f32>() / chunk.len().max(1) as f32).sqrt();
         if rms > Self::GATE {
             self.est += Self::ALPHA * (rms - self.est);
-            self.gain = (Self::TARGET_RMS / self.est.max(1e-4)).clamp(0.25, 4.0);
+            // Cap raised 4 -> 10: the field recording showed speech rms
+            // stuck at 0.061 (= raw x4), i.e. the cap was the binding
+            // constraint, not the estimate.
+            self.gain = (Self::TARGET_RMS / self.est.max(1e-4)).clamp(0.25, 10.0);
         }
         let n = chunk.len().max(1) as f32;
         let step = (self.gain - self.applied) / n;
@@ -866,6 +884,7 @@ fn run_xvc_conversion(
     controls: Arc<Controls>,
     cross_check: bool,
     window_ms: usize,
+    hop_ms_cfg: usize,
 ) -> anyhow::Result<()> {
     // Cross-window needle suppression is on unless --low-latency: it
     // holds each hop until the next window has re-rendered the same
@@ -880,11 +899,12 @@ fn run_xvc_conversion(
     // cannot absorb the compute — and leans on cross_check instead.
     let cfg = xvc::StreamConfig {
         chunk_ms: window_ms,
+        current_ms: hop_ms_cfg,
         cross_check,
         ..Default::default()
     };
     stats.lock().unwrap().engine_info = format!(
-        "window {window_ms} ms{}{}",
+        "window {window_ms} ms · hop {hop_ms_cfg} ms{}{}",
         if cross_check { " · xcheck" } else { "" },
         if window_ms <= 640 {
             " (short window: more needles — try --window-ms 1280+ if compute allows)"
@@ -899,7 +919,10 @@ fn run_xvc_conversion(
     let mut was_passthrough = false;
     // Gate hangover: keep converting this many chunks after the level
     // drops, so word tails are not clipped.
-    const HANGOVER: u32 = 2;
+    // Time-based gate ballistics (hop-size agnostic): ~480 ms hangover,
+    // ~1 s of true silence before the hard mute.
+    let hangover: u32 = (480 / hop_ms_cfg.max(1)) as u32;
+    let deep_chunks: u32 = (960 / hop_ms_cfg.max(1)) as u32;
     let mut open_for = 0u32;
     let mut deep_for = 0u32;
     let mut expander = SoftExpander::new(SR as f32);
@@ -1007,7 +1030,7 @@ fn run_xvc_conversion(
         let gate = controls.gate_db.load(Ordering::Relaxed);
         let db = 20.0 * in_level.max(1e-9).log10();
         if db >= gate as f32 {
-            open_for = HANGOVER + 1;
+            open_for = hangover + 1;
         }
         open_for = open_for.saturating_sub(1);
         if db < gate as f32 - 18.0 {
@@ -1015,8 +1038,7 @@ fn run_xvc_conversion(
         } else {
             deep_for = 0;
         }
-        const DEEP_CHUNKS: u32 = 4; // ~1 s of true silence
-        let gated = deep_for >= DEEP_CHUNKS;
+        let gated = deep_for >= deep_chunks;
 
         let mut processed: Vec<f32> = if mic_input {
             let mut c64: Vec<f64> = chunk.iter().map(|&s| s as f64).collect();
@@ -1081,7 +1103,23 @@ fn main() -> anyhow::Result<()> {
     let args = parse_args();
     let device = Device::Cpu;
     let engine = args.engine;
-    let chunk_samples = engine.chunk_samples();
+    // Hop default per device: 120 ms on CUDA (the official GPU preset).
+    // A needle lands in the emitted slice with p = hop/window, so
+    // halving the hop halves the audible-needle rate — and the
+    // algorithmic latency (hop + smooth + future) plus the cross-check
+    // hold BOTH drop by 120 ms. Compute doubles (worst hop ~43 ms
+    // against the 120 ms deadline — 36 % duty on CUDA). CPU keeps 240.
+    let xvc_hop_ms = args.hop_ms.unwrap_or_else(|| {
+        if matches!(xvc_device(args.cpu), Device::Cpu) {
+            240
+        } else {
+            120
+        }
+    });
+    let chunk_samples = match engine {
+        EngineKind::Xvc => xvc_hop_ms * SR / 1000,
+        _ => engine.chunk_samples(),
+    };
 
     eprintln!("loading models ({} engine)…", engine.name());
     let (models, vocos) = match engine {
@@ -1437,6 +1475,7 @@ fn main() -> anyhow::Result<()> {
             2_400
         }
     });
+
     let vc = std::thread::spawn(move || -> anyhow::Result<()> {
         let (model, asr, prompt_mel, spks) = match models {
             Models::Xvc {
@@ -1454,6 +1493,7 @@ fn main() -> anyhow::Result<()> {
                     controls_vc,
                     xvc_cross_check,
                     xvc_window_ms,
+                    xvc_hop_ms,
                 );
             }
             Models::MeanVc {
