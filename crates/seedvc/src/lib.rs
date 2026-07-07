@@ -29,4 +29,5 @@ pub mod dit;
 pub mod mel;
 pub mod pipeline;
 pub mod regulator;
+pub mod stream;
 pub mod whisper;

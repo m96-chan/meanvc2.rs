@@ -13,6 +13,9 @@ name = "babiniku-demo"
 path = "src/bin/demo.rs"
 
 [dependencies]
+# GPL-3.0 engine, strictly opt-in: binaries built WITHOUT the `seedvc`
+# feature carry no GPL obligations (see crates/seedvc/Cargo.toml).
+seedvc = { path = "../seedvc", optional = true }
 vc-core = { workspace = true }
 meanvc = { workspace = true }
 xvc = { workspace = true }
@@ -32,5 +35,8 @@ nnnoiseless = { version = "0.5", default-features = false }
 default = []
 # Compute the voice print natively from the reference audio (WavLM ONNX).
 wavlm = ["meanvc/wavlm"]
-cuda = ["meanvc/cuda", "xvc/cuda", "candle-core/cuda"]
+# Seed-VC engine (GPL-3.0!): enabling this feature makes distributed
+# binaries GPL — see crates/seedvc.
+seedvc = ["dep:seedvc"]
+cuda = ["meanvc/cuda", "xvc/cuda", "candle-core/cuda", "seedvc?/cuda"]
 metal = ["meanvc/metal", "xvc/metal", "candle-core/metal"]

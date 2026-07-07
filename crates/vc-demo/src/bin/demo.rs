@@ -79,6 +79,10 @@ const CHUNK_SAMPLES: usize = 3_200; // 200 ms = one CARD chunk (20 mel frames)
 /// X-VC hop: 240 ms of new audio per re-encoded 640 ms window (the CPU
 /// streaming preset 640/240/100/20 from issue #30).
 const XVC_CHUNK_SAMPLES: usize = 3_840;
+/// Seed-VC live block (320 ms at 16 kHz — the official real-time GUI
+/// range is 250–300 ms; 320 keeps whole 20 ms frames).
+#[cfg(feature = "seedvc")]
+const SEEDVC_CHUNK_SAMPLES: usize = 5_120;
 const FBANK_WINDOW: usize = 400; // kaldi 25 ms frame
 const FBANK_SHIFT: usize = 160; // kaldi 10 ms shift
 const BNF_CHUNK: usize = 5; // subsampled BNF frames per CARD chunk
@@ -110,6 +114,8 @@ struct Controls {
 enum EngineKind {
     MeanVc,
     Xvc,
+    #[cfg(feature = "seedvc")]
+    SeedVc,
 }
 
 impl EngineKind {
@@ -117,6 +123,8 @@ impl EngineKind {
         match self {
             EngineKind::MeanVc => "meanvc",
             EngineKind::Xvc => "xvc",
+            #[cfg(feature = "seedvc")]
+            EngineKind::SeedVc => "seedvc",
         }
     }
 
@@ -125,6 +133,8 @@ impl EngineKind {
         match self {
             EngineKind::MeanVc => CHUNK_SAMPLES,
             EngineKind::Xvc => XVC_CHUNK_SAMPLES,
+            #[cfg(feature = "seedvc")]
+            EngineKind::SeedVc => SEEDVC_CHUNK_SAMPLES,
         }
     }
 
@@ -133,6 +143,8 @@ impl EngineKind {
         match self {
             EngineKind::MeanVc => ["asr", "vc", "vocoder"],
             EngineKind::Xvc => ["semantic", "convert", "decode"],
+            #[cfg(feature = "seedvc")]
+            EngineKind::SeedVc => ["content", "cfm", "vocoder"],
         }
     }
 }
@@ -224,8 +236,13 @@ fn parse_args() -> Args {
                 a.engine = match it.next().as_deref() {
                     Some("meanvc") => EngineKind::MeanVc,
                     Some("xvc") => EngineKind::Xvc,
+                    #[cfg(feature = "seedvc")]
+                    Some("seedvc") => EngineKind::SeedVc,
                     other => {
-                        eprintln!("--engine must be meanvc or xvc (got {other:?})");
+                        eprintln!(
+                            "--engine must be meanvc or xvc{} (got {other:?})",
+                            if cfg!(feature = "seedvc") { " or seedvc" } else { "" }
+                        );
                         std::process::exit(2);
                     }
                 }
@@ -837,6 +854,11 @@ fn pulse_spec_out() -> Spec {
 enum OutMsg {
     Mel(Tensor),
     Raw(Vec<f32>),
+    /// Already at the 48 kHz output rate (Seed-VC path: BigVGAN gives
+    /// real bandwidth up to 11 kHz, so the 16→48 upsampler and pitch
+    /// stage are bypassed; exciter/leveler/limiter still apply).
+    #[cfg(feature = "seedvc")]
+    Raw48(Vec<f32>),
 }
 
 /// Per-engine model state, moved into the conversion thread.
@@ -852,6 +874,13 @@ enum Models {
         /// ([`xvc::XvcPipelinedStream`]).
         engine: std::sync::Arc<xvc::XvcEngine>,
         reference: xvc::Reference,
+    },
+    #[cfg(feature = "seedvc")]
+    SeedVc {
+        engine: std::sync::Arc<seedvc::pipeline::SeedVcEngine>,
+        /// Reference audio at 22 050 Hz (conditions are precomputed by
+        /// the stream itself).
+        ref_22k: Vec<f32>,
     },
 }
 
@@ -869,6 +898,130 @@ enum Models {
 /// of permanently flagging every later hop (steady-state pipeline latency
 /// sits ~100 ms above the first, contention-free hop; unbounded drift,
 /// not a constant offset, is what breaks live playback).
+/// Seed-VC live conversion (issue #50): sliding-context re-conversion
+/// per 320 ms block (`seedvc::stream::SeedVcStream`), soft-gate
+/// expander in front like the X-VC path, deep silence hard-skipped
+/// (whisper/CFM on pure silence both hallucinate and burn compute).
+/// Emits 48 kHz blocks (`OutMsg::Raw48`); there is no needle guard or
+/// cross-check — the BigVGAN decoder line has no needle pathology
+/// (issue #49), which is the reason this engine exists.
+#[cfg(feature = "seedvc")]
+#[allow(clippy::too_many_arguments)]
+fn run_seedvc_conversion(
+    engine: std::sync::Arc<seedvc::pipeline::SeedVcEngine>,
+    ref_22k: Vec<f32>,
+    mic_input: bool,
+    rx_in: std::sync::mpsc::Receiver<Vec<f32>>,
+    tx_out: std::sync::mpsc::SyncSender<OutMsg>,
+    stats: Arc<Mutex<Stats>>,
+    run: Arc<AtomicBool>,
+    controls: Arc<Controls>,
+) -> anyhow::Result<()> {
+    let cfg = seedvc::stream::StreamConfig::default();
+    let hop_s = cfg.block as f32 / SR as f32;
+    stats.lock().unwrap().engine_info = format!(
+        "block {} ms · ctx {:.1} s · cfm {} steps",
+        cfg.block * 1000 / SR,
+        cfg.context as f32 / SR as f32,
+        cfg.steps,
+    );
+    let mut stream = engine
+        .stream(&ref_22k, cfg)
+        .map_err(|e| anyhow::anyhow!("seedvc reference prep: {e}"))?;
+    let mut norm = MicVolumeNormalizer::new();
+    let mut hp = HighpassBiquad::new(SR as f64, 40.0);
+    let mut expander = SoftExpander::new(SR as f32);
+    let hangover: u32 = (480 / (cfg.block * 1000 / SR).max(1)) as u32;
+    let deep_chunks: u32 = (960 / (cfg.block * 1000 / SR).max(1)) as u32;
+    let mut open_for = 0u32;
+    let mut deep_for = 0u32;
+    let mut was_passthrough = false;
+
+    while run.load(Ordering::Relaxed) {
+        let chunk = match rx_in.recv_timeout(Duration::from_millis(50)) {
+            Ok(chunk) => chunk,
+            Err(_) => continue,
+        };
+        let passthrough = stats.lock().unwrap().passthrough;
+        let in_level = rms(&chunk);
+        if passthrough {
+            was_passthrough = true;
+            let mut st = stats.lock().unwrap();
+            st.in_rms = in_level;
+            st.out_rms = in_level;
+            st.chunks += 1;
+            drop(st);
+            let _ = tx_out.send(OutMsg::Raw(chunk));
+            continue;
+        }
+        if was_passthrough {
+            stream = engine
+                .stream(&ref_22k, cfg)
+                .map_err(|e| anyhow::anyhow!("seedvc stream restart: {e}"))?;
+            hp = HighpassBiquad::new(SR as f64, 40.0);
+            expander = SoftExpander::new(SR as f32);
+            was_passthrough = false;
+        }
+
+        let gate = controls.gate_db.load(Ordering::Relaxed);
+        let db = 20.0 * in_level.max(1e-9).log10();
+        if db >= gate as f32 {
+            open_for = hangover + 1;
+        }
+        open_for = open_for.saturating_sub(1);
+        if db < gate as f32 - 18.0 {
+            deep_for += 1;
+        } else {
+            deep_for = 0;
+        }
+        let gated = deep_for >= deep_chunks;
+
+        let mut prepared: Vec<f32> = if mic_input {
+            let mut c64: Vec<f64> = chunk.iter().map(|&s| s as f64).collect();
+            norm.process(&mut c64);
+            hp.process(&mut c64);
+            c64.iter().map(|&s| s as f32).collect()
+        } else {
+            chunk.clone()
+        };
+        expander.process(&mut prepared, open_for > 0);
+
+        {
+            let mut st = stats.lock().unwrap();
+            st.in_rms = in_level;
+            st.chunks += 1;
+            if gated {
+                st.gated += 1;
+            }
+        }
+        if gated {
+            // Deep silence: skip the model entirely, emit 48 kHz zeros.
+            let _ = tx_out.send(OutMsg::Raw48(vec![0.0; prepared.len() * 3]));
+            continue;
+        }
+        stream.push(&prepared);
+        while stream.ready() {
+            let t0 = Instant::now();
+            let Some(out48) = stream
+                .step()
+                .map_err(|e| anyhow::anyhow!("seedvc step: {e}"))?
+            else {
+                break;
+            };
+            let dt = t0.elapsed().as_secs_f32();
+            {
+                let mut st = stats.lock().unwrap();
+                st.rtf_vc = dt / hop_s;
+                if dt > hop_s {
+                    st.late += 1;
+                }
+            }
+            let _ = tx_out.send(OutMsg::Raw48(out48));
+        }
+    }
+    Ok(())
+}
+
 /// Microphone input is preprocessed incrementally (sliding-percentile
 /// volume normalization + streaming 40 Hz high-pass); wav input arrives
 /// already preprocessed offline.
@@ -1170,6 +1323,40 @@ fn main() -> anyhow::Result<()> {
                 None,
             )
         }
+        #[cfg(feature = "seedvc")]
+        EngineKind::SeedVc => {
+            let sdev = xvc_device(args.cpu);
+            let seng = seedvc::pipeline::SeedVcEngine::load("ckpt", &sdev)
+                .map_err(|e| anyhow::anyhow!("cannot load the Seed-VC engine: {e}"))?;
+            // The engine world is 22 050 Hz; accept any wav rate.
+            let mut r = hound::WavReader::open(&args.reference)?;
+            let spec = r.spec();
+            let raw: Vec<f32> = match spec.sample_format {
+                hound::SampleFormat::Int => {
+                    let scale = (1i64 << (spec.bits_per_sample - 1)) as f32;
+                    r.samples::<i32>()
+                        .step_by(spec.channels as usize)
+                        .map(|v| v.map(|x| x as f32 / scale))
+                        .collect::<Result<_, _>>()?
+                }
+                hound::SampleFormat::Float => r
+                    .samples::<f32>()
+                    .step_by(spec.channels as usize)
+                    .collect::<Result<_, _>>()?,
+            };
+            let ref_22k = if spec.sample_rate == 22_050 {
+                raw
+            } else {
+                seedvc::pipeline::resample(&raw, spec.sample_rate as usize, 22_050)
+            };
+            (
+                Models::SeedVc {
+                    engine: std::sync::Arc::new(seng),
+                    ref_22k,
+                },
+                None,
+            )
+        }
     };
 
     // Ctrl-C / SIGTERM funnels into the same shutdown path as `q`, so the
@@ -1240,6 +1427,10 @@ fn main() -> anyhow::Result<()> {
                 let raw: Vec<f64> = read_wav_16k(path)?.iter().map(|&s| s as f64).collect();
                 xvc::preprocess::preprocess(&raw, &Default::default())
             }
+            // Seed-VC file input needs no offline preprocessing: the
+            // stream handles rates internally from 16 kHz chunks.
+            #[cfg(feature = "seedvc")]
+            EngineKind::SeedVc => read_wav_16k(path)?,
         }),
     };
     let mic_input = wav_samples.is_none();
@@ -1379,8 +1570,33 @@ fn main() -> anyhow::Result<()> {
             let Ok(msg) = rx_out.recv_timeout(Duration::from_millis(300)) else {
                 continue;
             };
+            #[cfg(feature = "seedvc")]
+            if let OutMsg::Raw48(c) = &msg {
+                let mut c48 = c.clone();
+                leveler.process(&mut c48);
+                let wet =
+                    controls_out.bwe_wet.load(Ordering::Relaxed).clamp(0, 100) as f32 / 100.0;
+                exciter.process(&mut c48, wet);
+                limiter.process(&mut c48);
+                {
+                    let mut st = stats_out.lock().unwrap();
+                    st.out_rms = rms(&c48);
+                }
+                if let Some(p) = &play {
+                    let bytes: Vec<u8> = c48.iter().flat_map(|s| s.to_ne_bytes()).collect();
+                    p.write(&bytes).map_err(|e| anyhow::anyhow!("write: {e}"))?;
+                }
+                if let Some(w) = writer.as_mut() {
+                    for s in &c48 {
+                        w.write_sample((s.clamp(-1.0, 1.0) * 32767.0) as i16)?;
+                    }
+                }
+                continue;
+            }
             let chunk: Vec<f32> = match msg {
                 OutMsg::Raw(c) => c,
+                #[cfg(feature = "seedvc")]
+                OutMsg::Raw48(_) => unreachable!("handled above"),
                 OutMsg::Mel(mel) => {
                     // Vocoding with a mel tail as left context (MeanVC
                     // only; the X-VC engine decodes to waveform itself).
@@ -1478,6 +1694,19 @@ fn main() -> anyhow::Result<()> {
 
     let vc = std::thread::spawn(move || -> anyhow::Result<()> {
         let (model, asr, prompt_mel, spks) = match models {
+            #[cfg(feature = "seedvc")]
+            Models::SeedVc { engine, ref_22k } => {
+                return run_seedvc_conversion(
+                    engine,
+                    ref_22k,
+                    mic_input,
+                    rx_in,
+                    tx_out,
+                    stats_vc,
+                    run_vc,
+                    controls_vc,
+                );
+            }
             Models::Xvc {
                 engine: xeng,
                 reference,

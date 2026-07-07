@@ -96,6 +96,50 @@ impl SeedVcEngine {
         })
     }
 
+    /// Whisper content features from 16 kHz samples.
+    pub fn whisper_features(&self, wave16k: &[f32]) -> Result<Tensor> {
+        self.whisper.forward(wave16k, &self.device)
+    }
+
+    /// 22 050 Hz mel as a `[1, 80, T]` tensor.
+    pub fn mel22(&self, wave22k: &[f32]) -> Result<Tensor> {
+        self.mel_tensor(wave22k)
+    }
+
+    /// Length regulation of whisper features to `target_len` mel frames.
+    pub fn regulate(&self, features: &Tensor, target_len: usize) -> Result<Tensor> {
+        self.regulator.forward(features, target_len)
+    }
+
+    /// CAM++ fbank of a 16 kHz reference.
+    pub fn ref_fbank(&self, wave16k: &[f32]) -> Vec<Vec<f32>> {
+        self.fbank.extract(wave16k)
+    }
+
+    /// CAM++ speaker embedding from an fbank.
+    pub fn campplus_embed(&self, fbank: &[Vec<f32>]) -> Result<Tensor> {
+        self.campplus.embed(fbank, &self.device)
+    }
+
+    /// CFM sampling (see [`crate::dit::Cfm::inference`]).
+    pub fn cfm_inference(
+        &self,
+        cat_condition: &Tensor,
+        prompt_mel: &Tensor,
+        style: &Tensor,
+        noise: &Tensor,
+        steps: usize,
+        cfg_rate: f64,
+    ) -> Result<Tensor> {
+        self.cfm
+            .inference(cat_condition, prompt_mel, style, noise, steps, cfg_rate)
+    }
+
+    /// BigVGAN synthesis: `[1, 80, T]` mel → samples at 22 050 Hz.
+    pub fn vocode(&self, mel: &Tensor) -> Result<Vec<f32>> {
+        Ok(self.vocoder.forward(mel)?.flatten_all()?.to_vec1()?)
+    }
+
     fn mel_tensor(&self, wave22k: &[f32]) -> Result<Tensor> {
         let m = self.mel.extract(wave22k);
         let (bins, frames) = (m.len(), m[0].len());
