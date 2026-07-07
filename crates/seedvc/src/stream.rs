@@ -207,9 +207,9 @@ impl SeedVcStream<'_> {
             v
         };
         if self.tail.len() == xf {
-            for i in 0..xf {
+            for (i, (o, t)) in out22.iter_mut().zip(&self.tail).enumerate() {
                 let w = 0.5 - 0.5 * (std::f64::consts::PI * i as f64 / xf as f64).cos();
-                out22[i] = self.tail[i] * (1.0 - w as f32) + out22[i] * w as f32;
+                *o = t * (1.0 - w as f32) + *o * w as f32;
             }
         }
         // Hold back the crossfade tail for the next block: the emitted
