@@ -103,6 +103,8 @@ struct Controls {
     denoise_mix: AtomicI32,
     /// Output-side RNNoise wet % (Seed-VC path; < / > keys).
     out_denoise: AtomicI32,
+    /// Voice-profile EQ wet % (issue #62; ( / ) keys).
+    profile_eq: AtomicI32,
     /// BWE exciter wet amount in percent (0 = off; issue #42).
     bwe_wet: AtomicI32,
     /// Input gate threshold in dBFS (chunk RMS); the model hallucinates
@@ -189,6 +191,8 @@ struct Args {
     denoise_mix: i32,
     /// Output-side RNNoise wet % (Seed-VC).
     out_denoise: i32,
+    /// Voice-profile EQ wet % (issue #62).
+    profile_eq: i32,
     bwe: i32,
     gate_db: i32,
     headless: bool,
@@ -230,6 +234,7 @@ fn parse_args() -> Args {
         pitch_shift: 0.0,
         denoise_mix: 0,
         out_denoise: 0,
+        profile_eq: 0,
         bwe: 0,
         gate_db: -45,
         headless: false,
@@ -308,6 +313,13 @@ fn parse_args() -> Args {
                     .next()
                     .and_then(|v| v.parse().ok())
                     .expect("--pitch-shift <semitones>")
+            }
+            "--profile-eq" => {
+                a.profile_eq = it
+                    .next()
+                    .expect("--profile-eq <0-100>")
+                    .parse()
+                    .expect("--profile-eq takes an integer");
             }
             "--out-denoise" => {
                 a.out_denoise = it
@@ -1236,6 +1248,7 @@ fn main() -> anyhow::Result<()> {
         pitch_decisemitones: AtomicI32::new((args.pitch_shift * 10.0).round() as i32),
         denoise_mix: AtomicI32::new(args.denoise_mix.clamp(0, 100)),
         out_denoise: AtomicI32::new(args.out_denoise.clamp(0, 100)),
+        profile_eq: AtomicI32::new(args.profile_eq.clamp(0, 100)),
         bwe_wet: AtomicI32::new(args.bwe.clamp(0, 100)),
         gate_db: AtomicI32::new(args.gate_db),
     });
@@ -1326,6 +1339,31 @@ fn main() -> anyhow::Result<()> {
         }
     });
 
+    // Voice-profile EQ target (issue #62): the reference wav IS the
+    // target speaker's real voice; its LTAS is the shape the output
+    // should have. Engine-agnostic — read at native rate, resampled to
+    // the 48 kHz analysis domain.
+    let profile_eq = {
+        let mut r = hound::WavReader::open(&args.reference)?;
+        let spec = r.spec();
+        let raw: Vec<f32> = match spec.sample_format {
+            hound::SampleFormat::Int => {
+                let scale = (1i64 << (spec.bits_per_sample - 1)) as f32;
+                r.samples::<i32>()
+                    .step_by(spec.channels as usize)
+                    .map(|v| v.map(|x| x as f32 / scale))
+                    .collect::<Result<_, _>>()?
+            }
+            hound::SampleFormat::Float => r
+                .samples::<f32>()
+                .step_by(spec.channels as usize)
+                .collect::<Result<_, _>>()?,
+        };
+        let ref48 =
+            vc_core::profile::resample_analysis(&raw, spec.sample_rate as usize, 48_000);
+        vc_core::profile::ProfileEq::new(&ref48, spec.sample_rate as f32)
+    };
+
     // --- output thread: vocoding + playback (pipelined with the VC stage
     // so the two heaviest stages run concurrently).
     let (tx_out, rx_out) = std::sync::mpsc::sync_channel::<OutMsg>(8);
@@ -1335,6 +1373,7 @@ fn main() -> anyhow::Result<()> {
     let controls_out = controls.clone();
     let backend_out = backend.clone();
     let output = std::thread::spawn(move || -> anyhow::Result<()> {
+        let mut profile_eq = profile_eq;
         let mut stretch = Stretch::preset_default(1, SR as u32);
         let mut current_semi = 0f32;
         // Second shifter for the 48 kHz direct path (Seed-VC).
@@ -1401,7 +1440,12 @@ fn main() -> anyhow::Result<()> {
                     c48 = shifted;
                 }
                 leveler.process(&mut c48);
-                let wet = controls_out.bwe_wet.load(Ordering::Relaxed).clamp(0, 100) as f32 / 100.0;
+                let eq_wet =
+                    controls_out.profile_eq.load(Ordering::Relaxed).clamp(0, 100) as f32 / 100.0;
+                profile_eq.observe(&c48);
+                profile_eq.process(&mut c48, eq_wet);
+                let wet =
+                    controls_out.bwe_wet.load(Ordering::Relaxed).clamp(0, 100) as f32 / 100.0;
                 exciter.process(&mut c48, wet);
                 limiter.process(&mut c48);
                 {
@@ -1484,6 +1528,10 @@ fn main() -> anyhow::Result<()> {
             // the wet knob is open (0 % = bit-exact bypass).
             chunk48.clear();
             upsampler.process(&chunk, &mut chunk48);
+            let eq_wet =
+                controls_out.profile_eq.load(Ordering::Relaxed).clamp(0, 100) as f32 / 100.0;
+            profile_eq.observe(&chunk48);
+            profile_eq.process(&mut chunk48, eq_wet);
             let wet = controls_out.bwe_wet.load(Ordering::Relaxed).clamp(0, 100) as f32 / 100.0;
             exciter.process(&mut chunk48, wet);
             limiter.process(&mut chunk48);
@@ -1835,10 +1883,11 @@ fn run_tui(
             let bwe = controls.bwe_wet.load(Ordering::Relaxed);
             let gate = controls.gate_db.load(Ordering::Relaxed);
             let out_nr = controls.out_denoise.load(Ordering::Relaxed);
+            let peq = controls.profile_eq.load(Ordering::Relaxed);
             let names = engine.stage_names();
             f.render_widget(
                 Paragraph::new(format!(
-                    "RTF  {} {:.2} · {} {:.2} · {} {:.2}\nchunks {} · late {} · gated {} · ng {} · sp {} · xr {} · mode {}\npitch {:+.1} st ([ / ])  ·  denoise mix {}% (, / .)  ·  gate {} dB (- / =)\nbwe exciter {}% (; / ')  ·  out-nr {}% (< / >)  ·  output 48 kHz  ·  {}",
+                    "RTF  {} {:.2} · {} {:.2} · {} {:.2}\nchunks {} · late {} · gated {} · ng {} · sp {} · xr {} · mode {}\npitch {:+.1} st ([ / ])  ·  denoise mix {}% (, / .)  ·  gate {} dB (- / =)\nbwe exciter {}% (; / ')  ·  out-nr {}% (< / >)  ·  eq {}% (( / ))  ·  output 48 kHz  ·  {}",
                     names[0],
                     snapshot.2,
                     names[1],
@@ -1857,6 +1906,7 @@ fn run_tui(
                     gate,
                     bwe,
                     out_nr,
+                    peq,
                     if snapshot.10.is_empty() {
                         "engine defaults"
                     } else {
@@ -1911,6 +1961,18 @@ fn run_tui(
                         controls
                             .pitch_decisemitones
                             .store((v + 5).min(120), Ordering::Relaxed);
+                    }
+                    KeyCode::Char('(') => {
+                        let v = controls.profile_eq.load(Ordering::Relaxed);
+                        controls
+                            .profile_eq
+                            .store((v - 10).max(0), Ordering::Relaxed);
+                    }
+                    KeyCode::Char(')') => {
+                        let v = controls.profile_eq.load(Ordering::Relaxed);
+                        controls
+                            .profile_eq
+                            .store((v + 10).min(100), Ordering::Relaxed);
                     }
                     KeyCode::Char('<') => {
                         let v = controls.out_denoise.load(Ordering::Relaxed);
