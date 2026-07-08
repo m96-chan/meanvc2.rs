@@ -20,18 +20,21 @@ cargo run --release -p babiniku --features wavlm --bin babiniku -- \
     --reference her_voice.wav --monitor --denoise
 ```
 
-Live TUI knobs while you speak: pitch (`[` `]`), noise suppression (`,` `.`), input gate (`-` `=`), bandwidth extension (`;` `'`), passthrough A/B (`p`), self-monitor (`l`).
+Live TUI knobs while you speak: pitch (`[` `]`), noise suppression (`,` `.`), input gate (`-` `=`), bandwidth extension (`;` `'`), output noise reduction (`<` `>`), voice-profile EQ (`(` `)`), passthrough A/B (`p`), self-monitor (`l`).
 
-The engines synthesize at 16 kHz, so the TUI upsamples the converted voice to **48 kHz in-process** (exact ×3 windowed-sinc) before playback — the virtual mic runs at 48 kHz and `--out` recordings are written at 48 kHz. On top of that, `--bwe <0-100>` (or the `;`/`'` knob, off by default) blends in a pure-DSP **harmonic exciter** that synthesizes the missing 8–16 kHz band (sibilance/"air") from the 3–8 kHz band — it lifts the "gauzy" veil of 16 kHz output at zero added latency, on every engine ([#42](https://github.com/m96-chan/babiniku.rs/issues/42)).
+The virtual mic runs at **48 kHz** and `--out` recordings are written at 48 kHz: the 16 kHz engines (meanvc, xvc) are upsampled in-process (exact ×3 windowed-sinc), while Seed-VC synthesizes at 22.05 kHz and is resampled straight to 48 kHz. On top of that, `--bwe <0-100>` (or the `;`/`'` knob, off by default) blends in a pure-DSP **harmonic exciter** that synthesizes the missing 8–16 kHz band (sibilance/"air") from the 3–8 kHz band — it lifts the "gauzy" veil of 16 kHz output at zero added latency, on every engine ([#42](https://github.com/m96-chan/babiniku.rs/issues/42)).
 
 Quit with `q` — or Ctrl-C / SIGTERM, which run the same clean teardown of the virtual devices; stale `babiniku` devices left by a killed run are recovered automatically at the next startup.
 
-Pick the engine with `--engine meanvc` (default) or `--engine xvc`
+Pick the engine with `--engine meanvc` (default), `--engine xvc`
 (multilingual, incl. Japanese — needs the converted X-VC checkpoints in
 `ckpt/`, see [docs/xvc.md](docs/xvc.md); real-time on an idle 8-thread
-CPU via the pipelined driver, and comfortably real-time on a GPU with a
-`--features cuda` build — see the table below). The TUI shows the active
-engine and its per-stage RTF.
+CPU via the pipelined driver, comfortably real-time on a GPU with a
+`--features cuda` build), or `--engine seedvc` (the most natural voice
+of the three by ear — needs a build with **`--features seedvc`**, which
+is **GPL-3.0 when distributed**, and a GPU; converted checkpoints per
+`tools/convert_seedvc.py`). The TUI shows the active engine and its
+per-stage RTF.
 
 ## Use cases
 
@@ -47,6 +50,7 @@ engine and its per-stage RTF.
 | [MeanVC v1](docs/meanvc.md) | ✅ working, official weights | ~0.14 RTF end-to-end on CPU, ≈0.6 s latency; Mandarin-trained ([#28](https://github.com/m96-chan/babiniku.rs/issues/28) tracks Japanese) |
 | [MeanVC 2](docs/meanvc.md) | ⏳ implemented, awaiting official weights | 40 ms chunks → ~110 ms latency class |
 | [X-VC](docs/xvc.md) | ✅ working, official weights | Japanese-native quality; **live mic needs the CUDA build** (`--features cuda`, CUDA Toolkit at build time only — RTF ≈ 0.10 on GPU; CPU ≈ 0.9+ falls behind on a busy desktop) |
+| Seed-VC | ✅ working, official weights (**GPL-3.0, opt-in `seedvc` feature**) | Most natural by ear; 22.05 kHz BigVGAN line with **no decoder-needle pathology** (no declick stack needed); sliding-context streaming with SOLA joins, ~0.25 s/0.32 s block on GPU; adaptive voice-profile EQ toward the reference's real spectrum ([#49](https://github.com/m96-chan/babiniku.rs/issues/49)/[#50](https://github.com/m96-chan/babiniku.rs/issues/50)/[#62](https://github.com/m96-chan/babiniku.rs/issues/62)) |
 | [Zero-VC](docs/zero-vc.md) | 🔍 evaluation | zero-lookahead (20 ms algorithmic latency) — latency-first candidate; no public code yet ([#31](https://github.com/m96-chan/babiniku.rs/issues/31)) |
 
 Every engine is ported weight-compatible and verified stage-by-stage against its official implementation with golden tests (`cargo test --workspace`). Deep dive, APIs, checkpoint setup, performance notes: [docs/meanvc.md](docs/meanvc.md). Issues are labeled by architecture (`meanvc`, `meanvc2`, `xvc`, `seedvc`, `tui`, `infra`).
@@ -78,9 +82,10 @@ The repo is a cargo workspace — one crate per engine on a shared foundation:
 | [`crates/meanvc`](crates/meanvc) | MeanVC v1 + MeanVC 2 engines (library name `meanvc2`), examples, golden tests |
 | [`crates/babiniku`](crates/babiniku) | The `babiniku` real-time TUI / virtual-mic binary, plus the per-platform audio backends (`babiniku::audio`: Pulse on Linux, cpal/WASAPI/CoreAudio elsewhere) and the `audio_probe` example |
 | [`crates/xvc`](crates/xvc) | X-VC engine: GLM-4-Voice tokenizer, ERes2Net, SAC codec, prenet, MMDiT converter + the `XvcEngine` offline/streaming pipeline ([#30](https://github.com/m96-chan/babiniku.rs/issues/30)) |
+| [`crates/seedvc`](crates/seedvc) | Seed-VC engine (**GPL-3.0**, feature-gated): Whisper-small content, CAM++ speaker, DiT+WaveNet CFM, BigVGAN + `SeedVcEngine`/`SeedVcStream` ([#50](https://github.com/m96-chan/babiniku.rs/issues/50)) |
 
 Checkpoints stay at the repo root (`ckpt/`), as do `tools/` and `docs/`.
 
 ## License
 
-MIT OR Apache-2.0, at your option. Model weights belong to their original authors ([ASLP-lab/MeanVC](https://github.com/ASLP-lab/MeanVC) et al.). The avatar above is the maintainer's own — bring yours. Header/avatar artwork: a personal modification of a model by [こまど (Komado)](https://drive.google.com/file/d/1DuVNYmahJTelmDbZ1RVXXKQ7wuYPYy3u/view) — shown for illustration only; all rights to the original model belong to its creator.
+MIT OR Apache-2.0, at your option — except [`crates/seedvc`](crates/seedvc), which is **GPL-3.0** (upstream code and weights) and strictly opt-in: binaries built without the `seedvc` cargo feature carry no GPL obligations. Model weights belong to their original authors ([ASLP-lab/MeanVC](https://github.com/ASLP-lab/MeanVC) et al.). The avatar above is the maintainer's own — bring yours. Header/avatar artwork: a personal modification of a model by [こまど (Komado)](https://drive.google.com/file/d/1DuVNYmahJTelmDbZ1RVXXKQ7wuYPYy3u/view) — shown for illustration only; all rights to the original model belong to its creator.
