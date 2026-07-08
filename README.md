@@ -32,8 +32,8 @@ Pick the engine with `--engine meanvc` (default), `--engine xvc`
 CPU via the pipelined driver, comfortably real-time on a GPU with a
 `--features cuda` build), or `--engine seedvc` (the most natural voice
 of the three by ear — needs a build with **`--features seedvc`**, which
-is **GPL-3.0 when distributed**, and a GPU; converted checkpoints per
-`tools/convert_seedvc.py`). The TUI shows the active engine and its
+is **GPL-3.0 when distributed**, and a GPU; see
+[docs/seedvc.md](docs/seedvc.md)). The TUI shows the active engine and its
 per-stage RTF.
 
 ## Use cases
@@ -50,7 +50,7 @@ per-stage RTF.
 | [MeanVC v1](docs/meanvc.md) | ✅ working, official weights | ~0.14 RTF end-to-end on CPU, ≈0.6 s latency; Mandarin-trained ([#28](https://github.com/m96-chan/babiniku.rs/issues/28) tracks Japanese) |
 | [MeanVC 2](docs/meanvc.md) | ⏳ implemented, awaiting official weights | 40 ms chunks → ~110 ms latency class |
 | [X-VC](docs/xvc.md) | ✅ working, official weights | Japanese-native quality; **live mic needs the CUDA build** (`--features cuda`, CUDA Toolkit at build time only — RTF ≈ 0.10 on GPU; CPU ≈ 0.9+ falls behind on a busy desktop) |
-| Seed-VC | ✅ working, official weights (**GPL-3.0, opt-in `seedvc` feature**) | Most natural by ear; 22.05 kHz BigVGAN line with **no decoder-needle pathology** (no declick stack needed); sliding-context streaming with SOLA joins, ~0.25 s/0.32 s block on GPU; adaptive voice-profile EQ toward the reference's real spectrum ([#49](https://github.com/m96-chan/babiniku.rs/issues/49)/[#50](https://github.com/m96-chan/babiniku.rs/issues/50)/[#62](https://github.com/m96-chan/babiniku.rs/issues/62)) |
+| [Seed-VC](docs/seedvc.md) | ✅ working, official weights (**GPL-3.0, opt-in `seedvc` feature**) | Most natural by ear; 22.05 kHz BigVGAN line with **no decoder-needle pathology** (no declick stack needed); sliding-context streaming with SOLA joins, ~0.25 s/0.32 s block on GPU; adaptive voice-profile EQ toward the reference's real spectrum ([#49](https://github.com/m96-chan/babiniku.rs/issues/49)/[#50](https://github.com/m96-chan/babiniku.rs/issues/50)/[#62](https://github.com/m96-chan/babiniku.rs/issues/62)) |
 | [Zero-VC](docs/zero-vc.md) | 🔍 evaluation | zero-lookahead (20 ms algorithmic latency) — latency-first candidate; no public code yet ([#31](https://github.com/m96-chan/babiniku.rs/issues/31)) |
 
 Every engine is ported weight-compatible and verified stage-by-stage against its official implementation with golden tests (`cargo test --workspace`). Deep dive, APIs, checkpoint setup, performance notes: [docs/meanvc.md](docs/meanvc.md). Issues are labeled by architecture (`meanvc`, `meanvc2`, `xvc`, `seedvc`, `tui`, `infra`).
