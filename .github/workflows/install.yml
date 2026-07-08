@@ -1,0 +1,62 @@
+# cargo-install smoke (#69): `cargo install --git … babiniku` is the
+# supported install channel (crates.io is blocked on the candle-fork git
+# dependency until #10), so this job installs the binary from the
+# workspace exactly the way a user would — a fresh clone-and-build via
+# cargo's git source, not the checked-out target dir — and then runs it
+# OUTSIDE the checkout, proving the workspace layout, the candle git
+# dependency, and the installed-binary checkpoint resolution can't
+# silently rot.
+name: install
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cargo-install:
+    runs-on: ubuntu-latest
+    steps:
+      # cargo refuses to clone from a shallow repository, so fetch full
+      # history for the file:// install below.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Caches ~/.cargo (registry + the candle git checkout); the build
+      # itself runs in cargo-install's own temp target dir by design.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+
+      # The Linux audio backend links libpulse at build time.
+      - name: System dependencies
+        run: sudo apt-get update && sudo apt-get install -y libpulse-dev
+
+      - name: cargo install --git (the supported channel)
+        run: |
+          cargo install --git "file://$GITHUB_WORKSPACE" \
+            --rev "$(git rev-parse HEAD)" babiniku \
+            --root "$RUNNER_TEMP/babiniku-install"
+
+      # The installed binary must boot outside the repo checkout: report
+      # its version + feature set, and fail cleanly (exit 2, resolved
+      # platform ckpt path in the message) when no checkpoints exist.
+      - name: Installed binary runs outside the checkout
+        working-directory: ${{ runner.temp }}
+        run: |
+          BIN="$RUNNER_TEMP/babiniku-install/bin/babiniku"
+          "$BIN" --version | tee version.out
+          grep -q '^babiniku ' version.out
+          set +e
+          out=$("$BIN" --headless --no-sink 2>&1)
+          code=$?
+          set -e
+          echo "$out"
+          test "$code" -eq 2
+          echo "$out" | grep -q 'checkpoint directory not found'

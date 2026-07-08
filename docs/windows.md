@@ -81,7 +81,7 @@ output and prints a setup hint.
 
 ## Run the demo
 
-Checkpoints go under `ckpt/` at the workspace root — setup per
+Checkpoints go under `ckpt/` at the workspace root (installed binaries: `%APPDATA%\babiniku\ckpt`, or `--ckpt-dir` — #69) — setup per
 [docs/meanvc.md](meanvc.md) (MeanVC v1, the default engine) or
 [docs/xvc.md](xvc.md) (`--engine xvc`). Then:
 

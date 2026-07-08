@@ -75,7 +75,7 @@ to force a specific device, pass `--output-device "BlackHole 2ch"`.
 
 ## Run the demo
 
-With the checkpoints under `ckpt/` (setup: [docs/meanvc.md](meanvc.md); X-VC:
+With the checkpoints under `ckpt/` (installed binaries: `~/Library/Application Support/babiniku/ckpt`, or `--ckpt-dir` — #69; setup: [docs/meanvc.md](meanvc.md); X-VC:
 [docs/xvc.md](xvc.md)):
 
 ```sh

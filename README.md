@@ -26,6 +26,34 @@ The virtual mic runs at **48 kHz** and `--out` recordings are written at 48 kHz:
 
 Quit with `q` — or Ctrl-C / SIGTERM, which run the same clean teardown of the virtual devices; stale `babiniku` devices left by a killed run are recovered automatically at the next startup.
 
+## Install
+
+`cargo install --git` is the supported install channel ([#69](https://github.com/m96-chan/babiniku.rs/issues/69)) — a plain Rust toolchain is all you need, and CI smoke-tests this exact path on every change:
+
+```sh
+# CPU baseline — no CUDA Toolkit, no Python, works everywhere
+cargo install --git https://github.com/m96-chan/babiniku.rs babiniku
+# with a GPU / extras
+cargo install --git https://github.com/m96-chan/babiniku.rs babiniku --features cuda        # NVIDIA
+cargo install --git https://github.com/m96-chan/babiniku.rs babiniku --features metal       # Apple Silicon
+cargo install --git https://github.com/m96-chan/babiniku.rs babiniku --features wavlm       # native voice print from the reference wav
+cargo install --git https://github.com/m96-chan/babiniku.rs babiniku --features cuda,seedvc # + Seed-VC (GPL-3.0 build!)
+```
+
+| Feature | What it adds | Build-time needs |
+|---|---|---|
+| *(default)* | CPU real-time baseline, MeanVC + X-VC engines | none beyond Rust (Linux: `libpulse` headers) |
+| `wavlm` | voice print computed from the reference wav (ONNX Runtime) | downloads the prebuilt ONNX runtime |
+| `cuda` | NVIDIA GPU inference (X-VC live mic, Seed-VC) | CUDA Toolkit **at build time only** — at runtime the driver alone suffices |
+| `metal` | Apple-Silicon GPU inference | Xcode Command Line Tools |
+| `seedvc` | Seed-VC engine — **the binary becomes GPL-3.0 when distributed** | GPU recommended at runtime |
+
+`babiniku --version` prints the compiled feature set (and the GPL notice on `seedvc` builds), so a build's flavor is always auditable.
+
+An installed binary looks for checkpoints in the platform data directory — `~/.local/share/babiniku/ckpt` (Linux, honoring `$XDG_DATA_HOME`), `~/Library/Application Support/babiniku/ckpt` (macOS), `%APPDATA%\babiniku\ckpt` (Windows) — overridable with `--ckpt-dir <dir>` or `BABINIKU_CKPT_DIR`; from a repo checkout, `./ckpt` keeps working as before. Checkpoint setup per engine: [docs/meanvc.md](docs/meanvc.md) · [docs/xvc.md](docs/xvc.md) · [docs/seedvc.md](docs/seedvc.md) (a `babiniku-fetch` downloader is planned, [#65](https://github.com/m96-chan/babiniku.rs/issues/65)).
+
+Publishing to crates.io is blocked on the candle-fork **git dependency** (crates.io forbids git deps) until the forward-AD patch is upstreamed ([#10](https://github.com/m96-chan/babiniku.rs/issues/10)); until then every crate stays `publish = false` and `--git` is the way.
+
 Pick the engine with `--engine meanvc` (default), `--engine xvc`
 (multilingual, incl. Japanese — needs the converted X-VC checkpoints in
 `ckpt/`, see [docs/xvc.md](docs/xvc.md); real-time on an idle 8-thread
