@@ -1,6 +1,6 @@
 # Windows
 
-> Windows support for `babiniku-demo` via the cpal/WASAPI audio backend
+> Windows support for `babiniku` via the cpal/WASAPI audio backend
 > ([#52](https://github.com/m96-chan/babiniku.rs/issues/52),
 > [#53](https://github.com/m96-chan/babiniku.rs/issues/53)). Build- and
 > unit-verified; live verification on a real Windows machine is tracked
@@ -13,7 +13,7 @@ user-installed loopback driver (VB-CABLE), and you select the driver's
 output end as the microphone in your app.
 
 ```text
- mic ──► babiniku-demo ──► "CABLE Input"  ═ VB-CABLE ═  "CABLE Output" ──► Discord/OBS/Zoom
+ mic ──► babiniku ──► "CABLE Input"  ═ VB-CABLE ═  "CABLE Output" ──► Discord/OBS/Zoom
          (WASAPI capture)  (playback dev)   (loopback)   (recording dev)    (select as mic)
 ```
 
@@ -28,13 +28,13 @@ output end as the microphone in your app.
 ## Build
 
 ```powershell
-cargo build --release -p vc-demo
+cargo build --release -p babiniku
 ```
 
 ## Verify the audio stack (no checkpoints needed)
 
 ```powershell
-cargo run --release -p vc-demo --example audio_probe
+cargo run --release -p babiniku --example audio_probe
 ```
 
 The probe exercises the whole audio layer in seconds. Expected output:
@@ -67,7 +67,7 @@ skip the playback / capture halves (used by the headless CI smoke run in
 
 The demo auto-detects the route: any playback device whose name contains
 `CABLE Input`, `VB-Audio`, or `VoiceMeeter Input` is picked automatically
-(`pick_route_device` in `crates/vc-demo/src/audio/mod.rs`). To force a
+(`pick_route_device` in `crates/babiniku/src/audio/mod.rs`). To force a
 specific device:
 
 ```powershell
@@ -86,7 +86,7 @@ Checkpoints go under `ckpt/` at the workspace root — setup per
 [docs/xvc.md](xvc.md) (`--engine xvc`). Then:
 
 ```powershell
-cargo run --release -p vc-demo --features wavlm --bin babiniku-demo -- `
+cargo run --release -p babiniku --features wavlm --bin babiniku -- `
     --reference her_voice.wav
 ```
 

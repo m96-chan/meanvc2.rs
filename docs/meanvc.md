@@ -156,14 +156,14 @@ for (q, samples_200ms) in mic_chunks.enumerate() {
 }
 ```
 
-See [`crates/vc-demo/src/bin/demo.rs`](../crates/vc-demo/src/bin/demo.rs) for the complete real-time loop (gating, denoising, pitch shift, virtual mic) and [`crates/meanvc/examples/convert_v1.rs`](../crates/meanvc/examples/convert_v1.rs) for the offline pipeline.
+See [`crates/babiniku/src/bin/demo.rs`](../crates/babiniku/src/bin/demo.rs) for the complete real-time loop (gating, denoising, pitch shift, virtual mic) and [`crates/meanvc/examples/convert_v1.rs`](../crates/meanvc/examples/convert_v1.rs) for the offline pipeline.
 
 ## Real-time TUI demo with a virtual microphone (Linux)
 
-`babiniku-demo` converts your microphone in real time and exposes the result as a **virtual microphone** (`Babiniku-Virtual-Mic`, via a PipeWire/PulseAudio null sink) selectable from any app:
+`babiniku` converts your microphone in real time and exposes the result as a **virtual microphone** (`Babiniku-Virtual-Mic`, via a PipeWire/PulseAudio null sink) selectable from any app:
 
 ```sh
-cargo run --release -p vc-demo --features wavlm --bin babiniku-demo -- \
+cargo run --release -p babiniku --features wavlm --bin babiniku -- \
     --reference target_voice.wav
 ```
 
@@ -175,7 +175,7 @@ TUI shows level meters, per-stage RTF, and supports `p` (passthrough A/B), `l` (
 
 candle's CPU matmuls run on a rayon pool that defaults to **all logical cores**; on SMT (hyper-threaded) machines the resulting contention makes the small per-chunk workloads ~3–10× slower. Set `RAYON_NUM_THREADS` to the number of **physical** cores for the best CPU latency — measured on an 8c/16t machine ([#19](https://github.com/m96-chan/meanvc2.rs/issues/19)): demo vocoder chunk RTF 0.57 → 0.06, offline `convert_v1` end-to-end 456 ms → 226 ms.
 
-- `babiniku-demo` and the `convert_v1` example pin the pool to physical cores automatically when `RAYON_NUM_THREADS` is unset.
+- `babiniku` and the `convert_v1` example pin the pool to physical cores automatically when `RAYON_NUM_THREADS` is unset.
 - The other offline examples, and the library itself, use candle's default; set the variable yourself, e.g. `RAYON_NUM_THREADS=8 cargo run --release --example streaming_demo`.
 - When embedding the crate, set `RAYON_NUM_THREADS` (or configure the global rayon pool) before the first tensor op — the pool size is fixed at first use.
 

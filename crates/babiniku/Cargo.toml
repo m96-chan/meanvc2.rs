@@ -1,6 +1,6 @@
 [package]
-name = "vc-demo"
-description = "Real-time TUI voice-conversion demo with a virtual microphone (PulseAudio/PipeWire on Linux, VB-CABLE/BlackHole routing via cpal on Windows/macOS)"
+name = "babiniku"
+description = "Real-time TUI voice changer with a virtual microphone (PulseAudio/PipeWire on Linux, VB-CABLE/BlackHole routing via cpal on Windows/macOS)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,8 +9,8 @@ repository.workspace = true
 publish = false
 
 [[bin]]
-name = "babiniku-demo"
-path = "src/bin/demo.rs"
+name = "babiniku"
+path = "src/bin/babiniku.rs"
 
 [dependencies]
 # GPL-3.0 engine, strictly opt-in: binaries built WITHOUT the `seedvc`

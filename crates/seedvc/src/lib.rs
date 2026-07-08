@@ -10,7 +10,7 @@
 //! ## License
 //!
 //! This crate is **GPL-3.0** (the upstream implementation and released
-//! weights are GPL-3.0). It is feature-gated in `vc-demo`; the rest of
+//! weights are GPL-3.0). It is feature-gated in `babiniku`; the rest of
 //! the workspace remains MIT OR Apache-2.0, and binaries built without
 //! the `seedvc` feature carry no GPL obligations.
 //!

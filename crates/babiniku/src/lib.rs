@@ -1,4 +1,4 @@
-//! Library side of the `babiniku-demo` crate: the audio backend layer.
+//! Library side of the `babiniku` crate: the audio backend layer.
 //!
 //! The real-time pipeline (`src/bin/demo.rs`) is platform-independent; the
 //! platform surface — microphone capture, playback into the virtual-mic

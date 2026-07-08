@@ -7,7 +7,7 @@
 > loopback driver ([#53](https://github.com/m96-chan/babiniku.rs/issues/53)).
 
 On macOS the demo uses the portable [`cpal`](https://github.com/RustAudio/cpal)
-backend (`crates/vc-demo/src/audio/cpal_backend.rs`): capture and playback go
+backend (`crates/babiniku/src/audio/cpal_backend.rs`): capture and playback go
 through **CoreAudio**. macOS has no OS-level null sink, so the "virtual
 microphone" is a **route** — the converted voice plays into the input end of a
 user-installed loopback driver ([BlackHole](https://existential.audio/blackhole/)),
@@ -28,20 +28,20 @@ CoreAudio directly.
 ## Build
 
 ```sh
-cargo build --release -p vc-demo
+cargo build --release -p babiniku
 ```
 
 CPU is the baseline target and real-time on Apple Silicon. Optionally, the
 `metal` feature builds the engines against the Metal backend of candle:
 
 ```sh
-cargo build --release -p vc-demo --features metal
+cargo build --release -p babiniku --features metal
 ```
 
 ## Verify the audio stack (no checkpoints needed)
 
 ```sh
-cargo run --release -p vc-demo --example audio_probe
+cargo run --release -p babiniku --example audio_probe
 ```
 
 Expected output: `backend: cpal`, the capture/playback device lists CoreAudio
@@ -70,7 +70,7 @@ brew install blackhole-2ch
 (or the installer from <https://existential.audio/blackhole/>). BlackHole is a
 zero-latency loopback driver: whatever plays into the `BlackHole 2ch` output
 appears on the `BlackHole 2ch` input. The demo **auto-detects** it in the
-output-device list (`pick_route_device` in `crates/vc-demo/src/audio/mod.rs`);
+output-device list (`pick_route_device` in `crates/babiniku/src/audio/mod.rs`);
 to force a specific device, pass `--output-device "BlackHole 2ch"`.
 
 ## Run the demo
@@ -79,7 +79,7 @@ With the checkpoints under `ckpt/` (setup: [docs/meanvc.md](meanvc.md); X-VC:
 [docs/xvc.md](xvc.md)):
 
 ```sh
-cargo run --release -p vc-demo --features wavlm --bin babiniku-demo -- \
+cargo run --release -p babiniku --features wavlm --bin babiniku -- \
     --reference her_voice.wav
 ```
 
@@ -113,6 +113,6 @@ both destinations, at the cost of the demo no longer controlling the monitor.
 ## CI
 
 [.github/workflows/macos.yml](../.github/workflows/macos.yml) builds and tests
-`vc-demo` on an Apple Silicon runner, checks the `metal` feature still
+`babiniku` on an Apple Silicon runner, checks the `metal` feature still
 compiles, and smoke-runs `audio_probe --no-sink --no-capture` (backend init +
 device enumeration; CI runners have no audio devices).

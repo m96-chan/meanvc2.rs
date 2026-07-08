@@ -16,13 +16,13 @@
 babiniku.rs is the missing last mile: a **real-time zero-shot voice changer toolkit in pure Rust**. Give it a few seconds of your character's voice, speak, and a **virtual microphone** delivers her voice to Discord, Zoom, OBS — anything with a mic picker. On a plain CPU. No Python, no CUDA Toolkit, no cloud: your voice never leaves your machine.
 
 ```sh
-cargo run --release -p vc-demo --features wavlm --bin babiniku-demo -- \
+cargo run --release -p babiniku --features wavlm --bin babiniku -- \
     --reference her_voice.wav --monitor --denoise
 ```
 
 Live TUI knobs while you speak: pitch (`[` `]`), noise suppression (`,` `.`), input gate (`-` `=`), bandwidth extension (`;` `'`), passthrough A/B (`p`), self-monitor (`l`).
 
-The engines synthesize at 16 kHz, so the demo upsamples the converted voice to **48 kHz in-process** (exact ×3 windowed-sinc) before playback — the virtual mic runs at 48 kHz and `--out` recordings are written at 48 kHz. On top of that, `--bwe <0-100>` (or the `;`/`'` knob, off by default) blends in a pure-DSP **harmonic exciter** that synthesizes the missing 8–16 kHz band (sibilance/"air") from the 3–8 kHz band — it lifts the "gauzy" veil of 16 kHz output at zero added latency, on every engine ([#42](https://github.com/m96-chan/babiniku.rs/issues/42)).
+The engines synthesize at 16 kHz, so the TUI upsamples the converted voice to **48 kHz in-process** (exact ×3 windowed-sinc) before playback — the virtual mic runs at 48 kHz and `--out` recordings are written at 48 kHz. On top of that, `--bwe <0-100>` (or the `;`/`'` knob, off by default) blends in a pure-DSP **harmonic exciter** that synthesizes the missing 8–16 kHz band (sibilance/"air") from the 3–8 kHz band — it lifts the "gauzy" veil of 16 kHz output at zero added latency, on every engine ([#42](https://github.com/m96-chan/babiniku.rs/issues/42)).
 
 Quit with `q` — or Ctrl-C / SIGTERM, which run the same clean teardown of the virtual devices; stale `babiniku` devices left by a killed run are recovered automatically at the next startup.
 
@@ -49,11 +49,11 @@ engine and its per-stage RTF.
 | [X-VC](docs/xvc.md) | ✅ working, official weights | Japanese-native quality; **live mic needs the CUDA build** (`--features cuda`, CUDA Toolkit at build time only — RTF ≈ 0.10 on GPU; CPU ≈ 0.9+ falls behind on a busy desktop) |
 | [Zero-VC](docs/zero-vc.md) | 🔍 evaluation | zero-lookahead (20 ms algorithmic latency) — latency-first candidate; no public code yet ([#31](https://github.com/m96-chan/babiniku.rs/issues/31)) |
 
-Every engine is ported weight-compatible and verified stage-by-stage against its official implementation with golden tests (`cargo test --workspace`). Deep dive, APIs, checkpoint setup, performance notes: [docs/meanvc.md](docs/meanvc.md). Issues are labeled by architecture (`meanvc`, `meanvc2`, `demo`, `infra`).
+Every engine is ported weight-compatible and verified stage-by-stage against its official implementation with golden tests (`cargo test --workspace`). Deep dive, APIs, checkpoint setup, performance notes: [docs/meanvc.md](docs/meanvc.md). Issues are labeled by architecture (`meanvc`, `meanvc2`, `xvc`, `seedvc`, `tui`, `infra`).
 
 ## Platform support
 
-The engine core is pure Rust and portable; the platform surface — capture/playback and the **virtual microphone** — lives behind an audio backend layer in `crates/vc-demo` ([#51](https://github.com/m96-chan/babiniku.rs/issues/51), [#52](https://github.com/m96-chan/babiniku.rs/issues/52)).
+The engine core is pure Rust and portable; the platform surface — capture/playback and the **virtual microphone** — lives behind an audio backend layer in `crates/babiniku` ([#51](https://github.com/m96-chan/babiniku.rs/issues/51), [#52](https://github.com/m96-chan/babiniku.rs/issues/52)).
 
 | Platform | Capture / playback | Virtual mic | Status |
 |---|---|---|---|
@@ -65,7 +65,7 @@ The engine core is pure Rust and portable; the platform surface — capture/play
 Verify a platform's audio stack in seconds — no model checkpoints needed (lists devices, creates the virtual-mic route, plays a tone through it, captures 1 s of mic audio, tears down):
 
 ```sh
-cargo run --release -p vc-demo --example audio_probe
+cargo run --release -p babiniku --example audio_probe
 ```
 
 ## Workspace layout
@@ -76,7 +76,7 @@ The repo is a cargo workspace — one crate per engine on a shared foundation:
 |---|---|
 | [`crates/vc-core`](crates/vc-core) | Engine-agnostic foundation: encoder/speaker/vocoder traits, log-mel front-end, BWE post-processing (`bwe::Upsampler3x`, `bwe::Exciter`), `Error`/`Result` |
 | [`crates/meanvc`](crates/meanvc) | MeanVC v1 + MeanVC 2 engines (library name `meanvc2`), examples, golden tests |
-| [`crates/vc-demo`](crates/vc-demo) | The `babiniku-demo` real-time TUI / virtual-mic binary, plus the per-platform audio backends (`vc_demo::audio`: Pulse on Linux, cpal/WASAPI/CoreAudio elsewhere) and the `audio_probe` example |
+| [`crates/babiniku`](crates/babiniku) | The `babiniku` real-time TUI / virtual-mic binary, plus the per-platform audio backends (`babiniku::audio`: Pulse on Linux, cpal/WASAPI/CoreAudio elsewhere) and the `audio_probe` example |
 | [`crates/xvc`](crates/xvc) | X-VC engine: GLM-4-Voice tokenizer, ERes2Net, SAC codec, prenet, MMDiT converter + the `XvcEngine` offline/streaming pipeline ([#30](https://github.com/m96-chan/babiniku.rs/issues/30)) |
 
 Checkpoints stay at the repo root (`ckpt/`), as do `tools/` and `docs/`.

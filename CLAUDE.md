@@ -41,6 +41,9 @@ the simplest change, then refactor (red → green → refactor). New behavior sh
 be accompanied by tests; do not add functionality without a test that covers it.
 
 ### 2. Always run a demo before pushing
+*(“Demo” here means demonstrating your change — it is unrelated to the
+TUI app, which is the `babiniku` binary in `crates/babiniku`; the app
+shed its “demo” name in #67.)*
 **Never push without first demonstrating the change actually works.** Running the
 test suite is necessary but not sufficient — exercise the real behavior (run the
 relevant example / component and observe it) before every `git push`. If a
