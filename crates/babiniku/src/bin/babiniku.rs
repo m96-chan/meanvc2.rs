@@ -222,6 +222,13 @@ struct Args {
     cpu: bool,
 }
 
+/// Argument error: print a clean message instead of a panic backtrace.
+fn die(msg: &str) -> ! {
+    eprintln!("argument error: {msg}");
+    eprintln!("run with --help style docs in README.md / docs/");
+    std::process::exit(2);
+}
+
 fn parse_args() -> Args {
     let mut a = Args {
         engine: EngineKind::MeanVc,
@@ -271,37 +278,31 @@ fn parse_args() -> Args {
                     }
                 }
             }
-            "--reference" => a.reference = it.next().expect("--reference <wav>"),
+            "--reference" => a.reference = it.next().unwrap_or_else(|| die("--reference <wav>")),
             "--voice-print" => {
-                a.voice_print = Some(it.next().expect("--voice-print <safetensors>"))
+                a.voice_print = Some(it.next().unwrap_or_else(|| die("--voice-print <safetensors>")))
             }
-            "--wav" => a.wav = Some(it.next().expect("--wav <file>")),
-            "--out" => a.out = Some(it.next().expect("--out <file>")),
+            "--wav" => a.wav = Some(it.next().unwrap_or_else(|| die("--wav <file>"))),
+            "--out" => a.out = Some(it.next().unwrap_or_else(|| die("--out <file>"))),
             "--headless" => a.headless = true,
             "--low-latency" => a.low_latency = true,
             "--window-ms" => {
                 a.window_ms = Some(
-                    it.next()
-                        .expect("--window-ms <ms>")
-                        .parse()
-                        .expect("--window-ms takes an integer"),
+                    it.next().unwrap_or_else(|| die("--window-ms <ms>"))
+                        .parse().unwrap_or_else(|_| die("--window-ms takes an integer")),
                 )
             }
             #[cfg(feature = "seedvc")]
             "--cfm-steps" => {
                 a.cfm_steps = Some(
-                    it.next()
-                        .expect("--cfm-steps <n>")
-                        .parse()
-                        .expect("--cfm-steps takes an integer"),
+                    it.next().unwrap_or_else(|| die("--cfm-steps <n>"))
+                        .parse().unwrap_or_else(|_| die("--cfm-steps takes an integer")),
                 )
             }
             "--hop-ms" => {
                 a.hop_ms = Some(
-                    it.next()
-                        .expect("--hop-ms <ms>")
-                        .parse()
-                        .expect("--hop-ms takes an integer"),
+                    it.next().unwrap_or_else(|| die("--hop-ms <ms>"))
+                        .parse().unwrap_or_else(|_| die("--hop-ms takes an integer")),
                 )
             }
             "--cpu" => a.cpu = true,
@@ -312,42 +313,38 @@ fn parse_args() -> Args {
                 a.pitch_shift = it
                     .next()
                     .and_then(|v| v.parse().ok())
-                    .expect("--pitch-shift <semitones>")
+                    .unwrap_or_else(|| die("--pitch-shift <semitones>"))
             }
             "--profile-eq" => {
                 a.profile_eq = it
-                    .next()
-                    .expect("--profile-eq <0-100>")
-                    .parse()
-                    .expect("--profile-eq takes an integer");
+                    .next().unwrap_or_else(|| die("--profile-eq <0-100>"))
+                    .parse().unwrap_or_else(|_| die("--profile-eq takes an integer"));
             }
             "--out-denoise" => {
                 a.out_denoise = it
-                    .next()
-                    .expect("--out-denoise <0-100>")
-                    .parse()
-                    .expect("--out-denoise takes an integer");
+                    .next().unwrap_or_else(|| die("--out-denoise <0-100>"))
+                    .parse().unwrap_or_else(|_| die("--out-denoise takes an integer"));
             }
             "--denoise-mix" => {
                 a.denoise_mix = it
                     .next()
                     .and_then(|v| v.parse().ok())
-                    .expect("--denoise-mix <0-100>")
+                    .unwrap_or_else(|| die("--denoise-mix <0-100>"))
             }
             "--bwe" => {
                 a.bwe = it
                     .next()
                     .and_then(|v| v.parse().ok())
-                    .expect("--bwe <0-100>")
+                    .unwrap_or_else(|| die("--bwe <0-100>"))
             }
             "--gate" => {
                 a.gate_db = it
                     .next()
                     .and_then(|v| v.parse().ok())
-                    .expect("--gate <dBFS, e.g. -45>")
+                    .unwrap_or_else(|| die("--gate <dBFS, e.g. -45>"))
             }
-            "--input-device" => a.input_device = Some(it.next().expect("--input-device <source>")),
-            "--output-device" => a.output_device = Some(it.next().expect("--output-device <name>")),
+            "--input-device" => a.input_device = Some(it.next().unwrap_or_else(|| die("--input-device <source>"))),
+            "--output-device" => a.output_device = Some(it.next().unwrap_or_else(|| die("--output-device <name>"))),
             "--duration" => a.duration = it.next().and_then(|s| s.parse().ok()),
             other => {
                 eprintln!("unknown flag {other}");
@@ -1482,7 +1479,7 @@ fn main() -> anyhow::Result<()> {
                 OutMsg::Mel(mel) => {
                     // Vocoding with a mel tail as left context (MeanVC
                     // only; the X-VC engine decodes to waveform itself).
-                    let vocos = vocos.as_ref().expect("Mel chunks require the vocoder");
+                    let vocos = vocos.as_ref().unwrap_or_else(|| die("Mel chunks require the vocoder"));
                     let t0 = Instant::now();
                     let mel_win = match &mel_tail {
                         Some(tail) => Tensor::cat(&[tail, &mel], 1)?,
