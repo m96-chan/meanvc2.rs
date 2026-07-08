@@ -1,0 +1,60 @@
+# Attachment-spam moderation (maintainer decision, 2026-07): a wave of
+# throwaway accounts posts ZIP "patches" as issue-comment attachments.
+# This repo does not accept code as attachments — contributions are
+# fork + PR (CLAUDE.md). Any issue/comment from a non-collaborator that
+# links a file attachment is auto-hidden as spam with a fixed reply.
+name: moderation
+
+on:
+  issue_comment:
+    types: [created]
+  issues:
+    types: [opened]
+
+permissions:
+  issues: write
+
+jobs:
+  attachment-spam:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const body = (context.payload.comment?.body ?? context.payload.issue?.body) || "";
+            const author = (context.payload.comment?.user ?? context.payload.issue?.user).login;
+            const assoc = context.payload.comment?.author_association
+              ?? context.payload.issue?.author_association;
+            // File attachments only — inline images are left alone.
+            const attachment = /github\.com\/user-attachments\/files\//i.test(body)
+              || /\.(zip|rar|7z|exe|msi|dmg|scr|bat)\)/i.test(body);
+            const trusted = ["OWNER", "MEMBER", "COLLABORATOR"].includes(assoc);
+            if (!attachment || trusted) return;
+
+            const issue_number = context.issue.number;
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number,
+              body: `@${author} This repository does not accept code or files as attachments — ` +
+                    `contributions go through a fork + pull request (tests + demo per CLAUDE.md). ` +
+                    `The attachment was not downloaded and the post has been hidden. ` +
+                    `If you have a genuine patch, please open a PR.`,
+            });
+            if (context.payload.comment) {
+              await github.graphql(
+                `mutation($id: ID!) {
+                   minimizeComment(input: {subjectId: $id, classifier: SPAM}) {
+                     minimizedComment { isMinimized }
+                   }
+                 }`,
+                { id: context.payload.comment.node_id },
+              );
+            } else {
+              // Attachment in a fresh issue body: close it as spam.
+              await github.rest.issues.update({
+                ...context.repo,
+                issue_number,
+                state: "closed",
+                state_reason: "not_planned",
+              });
+            }
