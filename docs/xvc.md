@@ -117,7 +117,7 @@ against the official implementation with skip-if-absent golden tests
 Usage:
 
 - offline: `cargo run --release -p xvc --example convert_xvc -- <source.wav> <reference.wav> <out.wav>`
-- live: `cargo run --release -p vc-demo --bin babiniku-demo -- --engine xvc --reference her_voice.wav`
+- live: `cargo run --release -p babiniku --bin babiniku -- --engine xvc --reference her_voice.wav`
 - live knobs against decoder needle ticks (issue #42): the SAC decoder
   emits a short "needle" pulse per re-encoded window (present in the
   official implementation too — 8 needles/4 s at the 640 ms CPU preset
@@ -167,7 +167,7 @@ q8 quantization is off the table per the maintainer (fp32 only).
 - [x] CPU real-time feasibility — offline yes (0.69); streaming yes on an
       idle 8-thread box (pipelined driver, late 0), not yet under desktop
       co-load (#38)
-- [x] GPU real-time — `-p vc-demo --features cuda`: RTF ≈ 0.10, late 0
+- [x] GPU real-time — `-p babiniku --features cuda`: RTF ≈ 0.10, late 0
       under load (CUDA 13.3, sm_120)
 - [x] Streaming-parameter sweep — 640 ms window / 240 ms hop chosen as the
       CPU preset (quality holds; official 2400/120 preset available via
@@ -175,7 +175,7 @@ q8 quantization is off the table per the maintainer (fp32 only).
 
 Listening references in `ckpt/` (gitignored): `xvc_rust_ja_out_to_test_offline.wav`
 (ja → test.wav), `xvc_rust_M06_to_out_offline.wav` (babiniku direction:
-male JVS M06 → out.wav voice), `xvc_demo_out.wav` (live-demo streaming
+male JVS M06 → out.wav voice), `xbabiniku_out.wav` (live-demo streaming
 output), plus the Phase-0 official outputs `xvc_ja_*.wav` for A/B.
 
 ## Citation

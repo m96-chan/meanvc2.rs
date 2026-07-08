@@ -1,6 +1,6 @@
 //! Audio backend probe — the per-platform demo for issue #51 (#52/#53/#54).
 //!
-//! Exercises the whole `vc_demo::audio` surface without any model
+//! Exercises the whole `babiniku::audio` surface without any model
 //! checkpoints, so a new platform's audio stack can be verified in
 //! seconds before touching the full demo:
 //!
@@ -14,11 +14,11 @@
 //! 5. tears the route down again.
 //!
 //! ```sh
-//! cargo run --release -p vc-demo --example audio_probe -- \
+//! cargo run --release -p babiniku --example audio_probe -- \
 //!     [--output-device <name>] [--input-device <name>] [--no-capture] [--no-sink]
 //! ```
 
-use vc_demo::audio::{self, BackendOptions};
+use babiniku::audio::{self, BackendOptions};
 
 fn main() -> anyhow::Result<()> {
     let mut output_device = None;

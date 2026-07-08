@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "crates/vc-core",
     "crates/meanvc",
-    "crates/vc-demo",
+    "crates/babiniku",
     "crates/xvc",
     "crates/seedvc",
 ]

@@ -4,16 +4,16 @@
 //! with the selected engine (`--engine meanvc` (default, 200 ms chunks) or
 //! `--engine xvc` (240 ms hop, 640 ms re-encoded window — the official
 //! X-VC CPU streaming preset)), and plays the result into the platform's
-//! **virtual microphone** route (issue #51, `vc_demo::audio`): on Linux a
+//! **virtual microphone** route (issue #51, `babiniku::audio`): on Linux a
 //! PulseAudio/PipeWire null sink whose remapped monitor shows up as a
 //! selectable source (`babiniku_mic`); on Windows/macOS a user-installed
 //! loopback device (VB-CABLE / BlackHole), auto-detected or chosen with
 //! `--output-device`.
 //!
 //! ```sh
-//! cargo run --release -p vc-demo --bin babiniku-demo -- \
+//! cargo run --release -p babiniku --bin babiniku -- \
 //!     --reference ckpt/test.wav --voice-print ckpt/voice_print_test.safetensors
-//! cargo run --release -p vc-demo --bin babiniku-demo -- \
+//! cargo run --release -p babiniku --bin babiniku -- \
 //!     --engine xvc --reference her_voice.wav
 //! ```
 //!
@@ -70,7 +70,7 @@ use nnnoiseless::DenoiseState;
 use signalsmith_stretch::Stretch;
 use std::sync::atomic::AtomicI32;
 use vc_core::bwe::{Exciter, Upsampler3x};
-use vc_demo::audio::{self, AudioBackend};
+use babiniku::audio::{self, AudioBackend};
 use xvc::preprocess::HighpassBiquad;
 
 const SR: usize = 16_000;

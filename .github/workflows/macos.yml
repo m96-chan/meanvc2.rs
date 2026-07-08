@@ -10,7 +10,7 @@ on:
     branches: [main]
 
 jobs:
-  vc-demo:
+  babiniku:
     # macos-latest is Apple Silicon (aarch64-apple-darwin).
     runs-on: macos-latest
     steps:
@@ -20,16 +20,16 @@ jobs:
 
       # CPU is the baseline (CLAUDE.md): release build + tests, no features.
       - name: Build (release)
-        run: cargo build --release -p vc-demo
+        run: cargo build --release -p babiniku
 
       - name: Test
-        run: cargo test -p vc-demo
+        run: cargo test -p babiniku
 
       # The opt-in Metal GPU feature must keep compiling; a check is enough
       # (no GPU on the runner, and CPU stays the supported baseline).
       - name: Check the metal feature
-        run: cargo check -p vc-demo --features metal
+        run: cargo check -p babiniku --features metal
 
       # Headless audio smoke run: backend init + device enumeration only.
       - name: Audio probe (headless)
-        run: cargo run --release -p vc-demo --example audio_probe -- --no-sink --no-capture
+        run: cargo run --release -p babiniku --example audio_probe -- --no-sink --no-capture

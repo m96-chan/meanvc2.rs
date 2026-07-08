@@ -160,7 +160,7 @@ impl AudioBackend for PulseBackend {
     ) -> Result<Box<dyn CaptureStream>> {
         let s = Simple::new(
             None,
-            "babiniku-demo",
+            "babiniku",
             Direction::Record,
             device,
             "capture",
@@ -191,7 +191,7 @@ impl AudioBackend for PulseBackend {
     fn open_playback(&self, rate: u32) -> Result<Box<dyn PlaybackStream>> {
         let s = Simple::new(
             None,
-            "babiniku-demo",
+            "babiniku",
             Direction::Playback,
             Some(SINK),
             "converted",

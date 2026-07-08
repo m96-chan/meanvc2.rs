@@ -27,15 +27,15 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      # vc-demo pulls in the engine crates, so this covers the demo's
+      # babiniku pulls in the engine crates, so this covers the demo's
       # whole Windows build surface (cpal/WASAPI backend included).
-      - name: Build vc-demo (release)
-        run: cargo build --release -p vc-demo
+      - name: Build babiniku (release)
+        run: cargo build --release -p babiniku
 
-      - name: Test vc-demo
-        run: cargo test -p vc-demo
+      - name: Test babiniku
+        run: cargo test -p babiniku
 
       # Headless smoke: default_backend() on WASAPI + device enumeration,
       # no checkpoints, no audio hardware needed.
       - name: Audio probe (headless smoke)
-        run: cargo run --release -p vc-demo --example audio_probe -- --no-sink --no-capture
+        run: cargo run --release -p babiniku --example audio_probe -- --no-sink --no-capture
