@@ -129,6 +129,16 @@ cargo clippy --all-targets
 
 ## Conventions
 
+- **Tooling language policy (maintainer decision, 2026-07):**
+  - **Anything a USER runs is Rust** — demo, engines, setup/weight
+    conversion. End users must never need a Python environment
+    (`tools/convert_*.py` are slated for Rust replacements; see the
+    Rust-toolchain issue).
+  - **Quality-assurance comparisons stay Python — by design.** Golden
+    fixtures and parity references (`tools/gen_*_fixtures.py`) must be
+    produced by the *official* PyTorch implementations: their whole value
+    is being an independent ground truth. Porting them to Rust would make
+    the goldens self-referential and worthless. Do not "clean this up".
 - Keep new code consistent with the surrounding style; run `cargo fmt` and
   `cargo clippy` (both must be clean).
 - Tensor shapes follow `[batch, time, dim]`; document the shape of every
