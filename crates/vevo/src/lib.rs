@@ -23,4 +23,5 @@ pub mod hubert;
 pub mod mel;
 pub mod pipeline;
 pub mod repcodec;
+pub mod stream;
 pub mod vocos;

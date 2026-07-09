@@ -75,8 +75,8 @@ pub struct VevoEngine {
     hubert_std: Tensor,
     repcodec: RepCodec,
     mel: MelSpectrogram,
-    fmt: FlowMatchingTransformer,
-    vocos: Vocos,
+    pub(crate) fmt: FlowMatchingTransformer,
+    pub(crate) vocos: Vocos,
     device: Device,
 }
 
