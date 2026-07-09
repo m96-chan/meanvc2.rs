@@ -22,7 +22,7 @@ cargo run --release -p babiniku --features wavlm --bin babiniku -- \
 
 Live TUI knobs while you speak: pitch (`[` `]`), noise suppression (`,` `.`), input gate (`-` `=`), bandwidth extension (`;` `'`), output noise reduction (`<` `>`), voice-profile EQ (`(` `)`), passthrough A/B (`p`), self-monitor (`l`).
 
-The virtual mic runs at **48 kHz** and `--out` recordings are written at 48 kHz: the 16 kHz engines (meanvc, xvc) are upsampled in-process (exact ×3 windowed-sinc), while Seed-VC synthesizes at 22.05 kHz and is resampled straight to 48 kHz. On top of that, `--bwe <0-100>` (or the `;`/`'` knob, off by default) blends in a pure-DSP **harmonic exciter** that synthesizes the missing 8–16 kHz band (sibilance/"air") from the 3–8 kHz band — it lifts the "gauzy" veil of 16 kHz output at zero added latency, on every engine ([#42](https://github.com/m96-chan/babiniku.rs/issues/42)).
+The virtual mic runs at **48 kHz** and `--out` recordings are written at 48 kHz: the 16 kHz engines (meanvc, xvc) are upsampled in-process (exact ×3 windowed-sinc), while Seed-VC synthesizes at 22.05 kHz and CosyVoice2 at 24 kHz, each resampled straight to 48 kHz. On top of that, `--bwe <0-100>` (or the `;`/`'` knob, off by default) blends in a pure-DSP **harmonic exciter** that synthesizes the missing 8–16 kHz band (sibilance/"air") from the 3–8 kHz band — it lifts the "gauzy" veil of 16 kHz output at zero added latency, on every engine ([#42](https://github.com/m96-chan/babiniku.rs/issues/42)).
 
 Quit with `q` — or Ctrl-C / SIGTERM, which run the same clean teardown of the virtual devices; stale `babiniku` devices left by a killed run are recovered automatically at the next startup.
 
@@ -42,15 +42,15 @@ cargo install --git https://github.com/m96-chan/babiniku.rs babiniku --features 
 
 | Feature | What it adds | Build-time needs |
 |---|---|---|
-| *(default)* | CPU real-time baseline, MeanVC + X-VC engines | none beyond Rust (Linux: `libpulse` headers) |
+| *(default)* | CPU real-time baseline, MeanVC + X-VC + CosyVoice2 engines (CosyVoice2 live mic still needs a GPU) | none beyond Rust (Linux: `libpulse` headers) |
 | `wavlm` | voice print computed from the reference wav (ONNX Runtime) | downloads the prebuilt ONNX runtime |
-| `cuda` | NVIDIA GPU inference (X-VC live mic, Seed-VC) | CUDA Toolkit **at build time only** — at runtime the driver alone suffices |
+| `cuda` | NVIDIA GPU inference (X-VC live mic, Seed-VC, CosyVoice2 live mic) | CUDA Toolkit **at build time only** — at runtime the driver alone suffices |
 | `metal` | Apple-Silicon GPU inference | Xcode Command Line Tools |
 | `seedvc` | Seed-VC engine — **the binary becomes GPL-3.0 when distributed** | GPU recommended at runtime |
 
 `babiniku --version` prints the compiled feature set (and the GPL notice on `seedvc` builds), so a build's flavor is always auditable.
 
-An installed binary looks for checkpoints in the platform data directory — `~/.local/share/babiniku/ckpt` (Linux, honoring `$XDG_DATA_HOME`), `~/Library/Application Support/babiniku/ckpt` (macOS), `%APPDATA%\babiniku\ckpt` (Windows) — overridable with `--ckpt-dir <dir>` or `BABINIKU_CKPT_DIR`; from a repo checkout, `./ckpt` keeps working as before. Checkpoint setup per engine: [docs/meanvc.md](docs/meanvc.md) · [docs/xvc.md](docs/xvc.md) · [docs/seedvc.md](docs/seedvc.md) (a `babiniku-fetch` downloader is planned, [#65](https://github.com/m96-chan/babiniku.rs/issues/65)).
+An installed binary looks for checkpoints in the platform data directory — `~/.local/share/babiniku/ckpt` (Linux, honoring `$XDG_DATA_HOME`), `~/Library/Application Support/babiniku/ckpt` (macOS), `%APPDATA%\babiniku\ckpt` (Windows) — overridable with `--ckpt-dir <dir>` or `BABINIKU_CKPT_DIR`; from a repo checkout, `./ckpt` keeps working as before. Checkpoint setup per engine: [docs/meanvc.md](docs/meanvc.md) · [docs/xvc.md](docs/xvc.md) · [docs/seedvc.md](docs/seedvc.md) · [docs/cosyvoice.md](docs/cosyvoice.md) (a `babiniku-fetch` downloader is planned, [#65](https://github.com/m96-chan/babiniku.rs/issues/65)).
 
 Publishing to crates.io is blocked on the candle-fork **git dependency** (crates.io forbids git deps) until the forward-AD patch is upstreamed ([#10](https://github.com/m96-chan/babiniku.rs/issues/10)); until then every crate stays `publish = false` and `--git` is the way.
 
@@ -58,11 +58,12 @@ Pick the engine with `--engine meanvc` (default), `--engine xvc`
 (multilingual, incl. Japanese — needs the converted X-VC checkpoints in
 `ckpt/`, see [docs/xvc.md](docs/xvc.md); real-time on an idle 8-thread
 CPU via the pipelined driver, comfortably real-time on a GPU with a
-`--features cuda` build), or `--engine seedvc` (the most natural voice
-of the three by ear — needs a build with **`--features seedvc`**, which
-is **GPL-3.0 when distributed**, and a GPU; see
-[docs/seedvc.md](docs/seedvc.md)). The TUI shows the active engine and its
-per-stage RTF.
+`--features cuda` build), `--engine cosyvoice` (Apache-2.0, needs a GPU
+for live mic — see [docs/cosyvoice.md](docs/cosyvoice.md)), or `--engine
+seedvc` (the most natural voice by ear — needs a build with
+**`--features seedvc`**, which is **GPL-3.0 when distributed**, and a
+GPU; see [docs/seedvc.md](docs/seedvc.md)). The TUI shows the active
+engine and its per-stage RTF.
 
 ## Use cases
 
@@ -79,9 +80,10 @@ per-stage RTF.
 | [MeanVC 2](docs/meanvc.md) | ⏳ implemented, awaiting official weights | 40 ms chunks → ~110 ms latency class |
 | [X-VC](docs/xvc.md) | ✅ working, official weights | Japanese-native quality; **live mic needs the CUDA build** (`--features cuda`, CUDA Toolkit at build time only — RTF ≈ 0.10 on GPU; CPU ≈ 0.9+ falls behind on a busy desktop) |
 | [Seed-VC](docs/seedvc.md) | ✅ working, official weights (**GPL-3.0, opt-in `seedvc` feature**) | Most natural by ear; 22.05 kHz BigVGAN line with **no decoder-needle pathology** (no declick stack needed); sliding-context streaming with SOLA joins, ~0.25 s/0.32 s block on GPU; adaptive voice-profile EQ toward the reference's real spectrum ([#49](https://github.com/m96-chan/babiniku.rs/issues/49)/[#50](https://github.com/m96-chan/babiniku.rs/issues/50)/[#62](https://github.com/m96-chan/babiniku.rs/issues/62)) |
+| [CosyVoice2](docs/cosyvoice.md) | ✅ working, official weights (**Apache-2.0, default build**) | LLM-bypassed VC path (24 kHz HiFT, needle-clean like Seed-VC); **live mic needs a GPU** (`--features cuda`/`metal`, CPU RTF 1.3+); sliding-window streaming with an 80 ms crossfade, RTF ≈ 0.27 on GPU ([#71](https://github.com/m96-chan/babiniku.rs/issues/71)/[#75](https://github.com/m96-chan/babiniku.rs/issues/75)) |
 | [Zero-VC](docs/zero-vc.md) | 🔍 evaluation | zero-lookahead (20 ms algorithmic latency) — latency-first candidate; no public code yet ([#31](https://github.com/m96-chan/babiniku.rs/issues/31)) |
 
-Every engine is ported weight-compatible and verified stage-by-stage against its official implementation with golden tests (`cargo test --workspace`). Deep dive, APIs, checkpoint setup, performance notes: [docs/meanvc.md](docs/meanvc.md). Issues are labeled by architecture (`meanvc`, `meanvc2`, `xvc`, `seedvc`, `tui`, `infra`).
+Every engine is ported weight-compatible and verified stage-by-stage against its official implementation with golden tests (`cargo test --workspace`). Deep dive, APIs, checkpoint setup, performance notes: [docs/meanvc.md](docs/meanvc.md). Issues are labeled by architecture (`meanvc`, `meanvc2`, `xvc`, `seedvc`, `cosyvoice`, `tui`, `infra`).
 
 ## Platform support
 
@@ -111,6 +113,7 @@ The repo is a cargo workspace — one crate per engine on a shared foundation:
 | [`crates/babiniku`](crates/babiniku) | The `babiniku` real-time TUI / virtual-mic binary, plus the per-platform audio backends (`babiniku::audio`: Pulse on Linux, cpal/WASAPI/CoreAudio elsewhere) and the `audio_probe` example |
 | [`crates/xvc`](crates/xvc) | X-VC engine: GLM-4-Voice tokenizer, ERes2Net, SAC codec, prenet, MMDiT converter + the `XvcEngine` offline/streaming pipeline ([#30](https://github.com/m96-chan/babiniku.rs/issues/30)) |
 | [`crates/seedvc`](crates/seedvc) | Seed-VC engine (**GPL-3.0**, feature-gated): Whisper-small content, CAM++ speaker, DiT+WaveNet CFM, BigVGAN + `SeedVcEngine`/`SeedVcStream` ([#50](https://github.com/m96-chan/babiniku.rs/issues/50)) |
+| [`crates/cosyvoice`](crates/cosyvoice) | CosyVoice2 engine (**Apache-2.0**, default build): FSQ tokenizer, causal conformer + CFM flow, HiFT vocoder + `CosyVoiceEngine`/`CosyVoiceStream` ([#75](https://github.com/m96-chan/babiniku.rs/issues/75)) |
 
 Checkpoints stay at the repo root (`ckpt/`), as do `tools/` and `docs/`.
 

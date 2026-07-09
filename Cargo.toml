@@ -6,6 +6,7 @@ members = [
     "crates/babiniku",
     "crates/xvc",
     "crates/seedvc",
+    "crates/cosyvoice",
 ]
 
 [workspace.package]

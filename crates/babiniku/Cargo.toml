@@ -16,6 +16,9 @@ path = "src/bin/babiniku.rs"
 # GPL-3.0 engine, strictly opt-in: binaries built WITHOUT the `seedvc`
 # feature carry no GPL obligations (see crates/seedvc/Cargo.toml).
 seedvc = { path = "../seedvc", optional = true }
+# Apache-2.0 (upstream code + CosyVoice2-0.5B weights, issue #71): ships in
+# the default build, unlike the GPL-gated seedvc above.
+cosyvoice = { path = "../cosyvoice" }
 vc-core = { workspace = true }
 meanvc = { workspace = true }
 xvc = { workspace = true }
@@ -48,8 +51,8 @@ wavlm = ["meanvc/wavlm"]
 # Seed-VC engine (GPL-3.0!): enabling this feature makes distributed
 # binaries GPL — see crates/seedvc.
 seedvc = ["dep:seedvc"]
-cuda = ["meanvc/cuda", "xvc/cuda", "candle-core/cuda", "seedvc?/cuda"]
-metal = ["meanvc/metal", "xvc/metal", "candle-core/metal"]
+cuda = ["meanvc/cuda", "xvc/cuda", "candle-core/cuda", "seedvc?/cuda", "cosyvoice/cuda"]
+metal = ["meanvc/metal", "xvc/metal", "candle-core/metal", "cosyvoice/metal"]
 # Build the portable cpal backend on Linux too (ALSA headers required at
 # build time); groundwork for the pure-ALSA fallback (#55).
 cpal-backend = ["dep:cpal"]

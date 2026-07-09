@@ -1,0 +1,21 @@
+[package]
+name = "cosyvoice"
+version = "0.1.0"
+edition.workspace = true
+# Upstream CosyVoice code and the CosyVoice2-0.5B weights are Apache-2.0,
+# so unlike seedvc this engine ships in the default MIT OR Apache-2.0 build.
+license.workspace = true
+publish = false
+
+[dependencies]
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+vc-core = { path = "../vc-core" }
+rustfft = { workspace = true }
+
+[dev-dependencies]
+hound = { workspace = true }
+
+[features]
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+metal = ["candle-core/metal", "candle-nn/metal"]
