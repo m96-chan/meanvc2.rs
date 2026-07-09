@@ -73,9 +73,27 @@ pub struct CosyVoiceStream<'a> {
     engine: &'a CosyVoiceEngine,
     reference: Reference,
     cfg: StreamConfig,
-    /// Rolling raw 16 kHz source buffer (all audio seen so far, trimmed
-    /// to `context + block` once a hop consumes it).
+    /// Sliding 16 kHz source buffer, kept trimmed to `context + block`
+    /// (or `context + pending` while a hop's worth hasn't arrived yet)
+    /// in [`Self::push`] — this is what actually gives the encoder its
+    /// 3.0 s of left context. An earlier version drained the *entire*
+    /// buffer on every `step()`, which reset it to empty each hop and
+    /// silently zeroed `context` out of the pipeline: every hop
+    /// tokenized/encoded a bare, history-free 1.0 s slice, and an
+    /// ambiguous slice (near-silence/background noise, no anchoring
+    /// speech) was enough for HiFT's F0 predictor to lock onto a
+    /// spurious low frequency and produce a loud drone (field report,
+    /// reproduced with a synthetic speech→room-tone wav: RMS jumped
+    /// 0.04→0.31→0.41 and the spectral peak collapsed to 33–37 Hz the
+    /// moment the window went silence-dominated, in the streaming path
+    /// only — neither the official nor this crate's own offline
+    /// single-pass conversion showed it on the same audio).
     buf: Vec<f32>,
+    /// New samples appended since the last `step()`, in 16 kHz units —
+    /// separate from `buf.len()` because `buf` is capped at
+    /// `context + block` and would otherwise make `ready()` lie once
+    /// steady state is reached.
+    pending: usize,
     /// Last `crossfade_24k` samples of the previous hop's render, held
     /// back for blending; `None` before the first hop.
     tail: Option<Vec<f32>>,
@@ -110,6 +128,7 @@ impl CosyVoiceEngine {
             reference,
             cfg,
             buf: Vec::new(),
+            pending: 0,
             tail: None,
             fade_in,
             fade_out,
@@ -119,15 +138,23 @@ impl CosyVoiceEngine {
 
 impl CosyVoiceStream<'_> {
     /// Feed new source audio (any sample rate — resampled internally to
-    /// 16 kHz and appended to the rolling buffer).
+    /// 16 kHz). `buf` is trimmed to the working window
+    /// (`context + max(block, pending)`) here, not in [`Self::step`], so
+    /// history genuinely survives across hops.
     pub fn push(&mut self, samples: &[f32], sr: u32) {
         let s16k = resample_analysis(samples, sr as usize, TOKEN_SR as usize);
         self.buf.extend_from_slice(&s16k);
+        self.pending += s16k.len();
+        let keep = self.cfg.context + self.cfg.block.max(self.pending);
+        if self.buf.len() > keep {
+            let drop = self.buf.len() - keep;
+            self.buf.drain(..drop);
+        }
     }
 
-    /// Whether a full hop's worth of new audio is buffered.
+    /// Whether a full hop's worth of new audio has arrived.
     pub fn ready(&self) -> bool {
-        self.buf.len() >= self.cfg.block
+        self.pending >= self.cfg.block
     }
 
     /// Render one hop. Returns `None` if [`Self::ready`] is false.
@@ -141,6 +168,7 @@ impl CosyVoiceStream<'_> {
         if !self.ready() {
             return Ok(None);
         }
+        self.pending -= self.cfg.block;
         let window_len = (self.cfg.context + self.cfg.block).min(self.buf.len());
         let window = &self.buf[self.buf.len() - window_len..];
 
@@ -153,27 +181,46 @@ impl CosyVoiceStream<'_> {
             &self.reference.feat,
             false,
         )?;
-        let (audio, _source) = self.engine.hift_ref().vocode(&mel, NoiseMode::Random)?;
+        let (full_audio, _source) = self.engine.hift_ref().vocode(&mel, NoiseMode::Random)?;
 
-        // Consume the block from the rolling buffer now that it's rendered.
-        let consumed = self.cfg.block.min(self.buf.len());
-        self.buf.drain(0..consumed);
+        // full_audio covers the whole window (up to context + block);
+        // only the trailing block-worth (+ crossfade margin) is new —
+        // the rest already went out in earlier hops. Mirrors
+        // `crates/seedvc/src/stream.rs`'s `emitted = out22[k_best..]`
+        // narrowing (no SOLA search needed here: HiFT has no run-to-run
+        // diffusion variance, so a plain crossfade suffices).
+        let block_24k = self.cfg.block * MEL_SR as usize / TOKEN_SR as usize;
+        let cf = self.cfg.crossfade_24k.min(block_24k);
+        let need = block_24k + cf;
+        let audio: Vec<f32> = if full_audio.len() >= need {
+            full_audio[full_audio.len() - need..].to_vec()
+        } else {
+            // Early hops: the window (and therefore full_audio) is
+            // still shorter than a full block + crossfade. Pad the
+            // front with silence rather than repeating samples.
+            let mut v = vec![0.0; need - full_audio.len()];
+            v.extend_from_slice(&full_audio);
+            v
+        };
 
-        let cf = self.cfg.crossfade_24k.min(audio.len() / 2);
+        // audio is `block_24k + cf` samples: [0, cf) overlaps the
+        // previous hop's held-back tail, [cf, block_24k) is this hop's
+        // settled middle, and [block_24k, need) becomes the *next*
+        // hop's overlap — held back, not emitted now.
         let out_24k = match self.tail.take() {
             Some(prev_tail) if cf > 0 => {
-                let mut blended = Vec::with_capacity(audio.len() - cf);
+                let mut blended = Vec::with_capacity(block_24k);
                 for i in 0..cf {
                     blended.push(prev_tail[i] * self.fade_out[i] + audio[i] * self.fade_in[i]);
                 }
-                blended.extend_from_slice(&audio[cf..audio.len() - cf]);
-                self.tail = Some(audio[audio.len() - cf..].to_vec());
+                blended.extend_from_slice(&audio[cf..block_24k]);
+                self.tail = Some(audio[block_24k..].to_vec());
                 blended
             }
             _ => {
                 if cf > 0 {
-                    self.tail = Some(audio[audio.len() - cf..].to_vec());
-                    audio[..audio.len() - cf].to_vec()
+                    self.tail = Some(audio[block_24k..].to_vec());
+                    audio[..block_24k].to_vec()
                 } else {
                     audio
                 }

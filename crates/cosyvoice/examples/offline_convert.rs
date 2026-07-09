@@ -39,7 +39,12 @@ fn main() {
     let out = eng.convert_offline(&src, src_sr, &reference).unwrap();
     let elapsed = t0.elapsed().as_secs_f32();
     let out_dur = out.len() as f32 / cosyvoice::MEL_SR as f32;
-    println!("RTF {:.3} ({:.2}s in {:.2}s)", elapsed / out_dur, out_dur, elapsed);
+    println!(
+        "RTF {:.3} ({:.2}s in {:.2}s)",
+        elapsed / out_dur,
+        out_dur,
+        elapsed
+    );
     let mut w = hound::WavWriter::create(
         &a[2],
         hound::WavSpec {
@@ -51,7 +56,8 @@ fn main() {
     )
     .unwrap();
     for s in &out {
-        w.write_sample((s.clamp(-1.0, 1.0) * 32767.0) as i16).unwrap();
+        w.write_sample((s.clamp(-1.0, 1.0) * 32767.0) as i16)
+            .unwrap();
     }
     w.finalize().unwrap();
     println!("wrote {} ({} samples)", a[2], out.len());

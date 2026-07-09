@@ -87,6 +87,23 @@ so a plain crossfade — no SOLA phase search — is enough to hide the seam
 Cost: the flow reruns over the whole window every hop (not incremental),
 so this is **CUDA/Metal-only for live use**, same as Seed-VC.
 
+**Field bug, fixed:** an early version drained the *entire* rolling
+buffer on every hop instead of only the new block, which silently zeroed
+`context` out of the pipeline — every hop tokenized/encoded a bare,
+history-free 1.0 s slice. An ambiguous slice (near-silence / background
+noise with no anchoring speech) was enough for HiFT's F0 predictor to
+lock onto a spurious low frequency and produce a loud drone. Reproduced
+with a synthetic speech→room-tone wav (`stream_tail_probe` example):
+per-hop RMS jumped 0.04→0.31→0.41 and the spectral peak collapsed to
+33–37 Hz the moment the window went silence-dominated — in the streaming
+path *only*; neither the official implementation nor this crate's own
+offline single-pass conversion showed it on the same audio, confirming
+it was a streaming-driver bug, not a model or porting issue. Fixed by
+tracking buffered-but-unconsumed input separately from the sliding
+context window (mirroring `crates/seedvc/src/stream.rs`'s `pending`
+counter) and narrowing each hop's emission to the new block only instead
+of the whole re-rendered window.
+
 ## Usage
 
 ```sh
