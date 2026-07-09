@@ -21,5 +21,6 @@ pub use vc_core::{Error, Result};
 pub mod fmt;
 pub mod hubert;
 pub mod mel;
+pub mod pipeline;
 pub mod repcodec;
 pub mod vocos;
