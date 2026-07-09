@@ -228,6 +228,15 @@ struct Args {
     /// quality per hop, fewer = more real-time headroom).
     #[cfg(feature = "seedvc")]
     cfm_steps: Option<usize>,
+    /// CosyVoice2 streaming left-context override, in seconds (default
+    /// 3.0). More context can stabilize speaker conditioning on
+    /// harder (fast/expressive/less clearly voiced) material at
+    /// roughly proportional extra compute per hop — field-tested
+    /// mixed results, not a guaranteed win (see docs/cosyvoice.md).
+    cosyvoice_context_s: Option<f32>,
+    /// CosyVoice2 streaming crossfade override, in milliseconds
+    /// (default 80).
+    cosyvoice_crossfade_ms: Option<f32>,
     /// X-VC hop override (ms). Smaller hops shrink both the audible
     /// needle probability (the emitted slice is a smaller fraction of
     /// the window) and the algorithmic latency, at proportionally more
@@ -271,6 +280,8 @@ fn parse_args() -> Args {
         hop_ms: None,
         #[cfg(feature = "seedvc")]
         cfm_steps: None,
+        cosyvoice_context_s: None,
+        cosyvoice_crossfade_ms: None,
         monitor: false,
         denoise: false,
         duration: None,
@@ -335,6 +346,22 @@ fn parse_args() -> Args {
                         .unwrap_or_else(|| die("--cfm-steps <n>"))
                         .parse()
                         .unwrap_or_else(|_| die("--cfm-steps takes an integer")),
+                )
+            }
+            "--cosyvoice-context-s" => {
+                a.cosyvoice_context_s = Some(
+                    it.next()
+                        .unwrap_or_else(|| die("--cosyvoice-context-s <seconds, e.g. 3.0>"))
+                        .parse()
+                        .unwrap_or_else(|_| die("--cosyvoice-context-s takes a number")),
+                )
+            }
+            "--cosyvoice-crossfade-ms" => {
+                a.cosyvoice_crossfade_ms = Some(
+                    it.next()
+                        .unwrap_or_else(|| die("--cosyvoice-crossfade-ms <ms, e.g. 80>"))
+                        .parse()
+                        .unwrap_or_else(|_| die("--cosyvoice-crossfade-ms takes a number")),
                 )
             }
             "--hop-ms" => {
@@ -932,6 +959,8 @@ fn run_seedvc_conversion(
 fn run_cosyvoice_conversion(
     engine: std::sync::Arc<cosyvoice::CosyVoiceEngine>,
     ref_16k: Vec<f32>,
+    context_s: Option<f32>,
+    crossfade_ms: Option<f32>,
     mic_input: bool,
     rx_in: std::sync::mpsc::Receiver<Vec<f32>>,
     tx_out: std::sync::mpsc::SyncSender<OutMsg>,
@@ -939,7 +968,16 @@ fn run_cosyvoice_conversion(
     run: Arc<AtomicBool>,
     controls: Arc<Controls>,
 ) -> anyhow::Result<()> {
-    let cfg = cosyvoice::StreamConfig::default();
+    let mut cfg = cosyvoice::StreamConfig::default();
+    if let Some(s) = context_s {
+        // Round to the nearest whole token (640 samples @ 16 kHz) like
+        // the block/context invariant `stream()` asserts.
+        let samples = (s * SR as f32) as usize;
+        cfg.context = (samples / 640).max(1) * 640;
+    }
+    if let Some(ms) = crossfade_ms {
+        cfg.crossfade_24k = ((ms / 1000.0) * cosyvoice::MEL_SR as f32) as usize;
+    }
     let hop_s = cfg.block as f32 / SR as f32;
     stats.lock().unwrap().engine_info = format!(
         "block {} ms · ctx {:.1} s · crossfade {} ms",
@@ -1827,6 +1865,8 @@ fn main() -> anyhow::Result<()> {
     let xvc_cross_check = !args.low_latency;
     #[cfg(feature = "seedvc")]
     let seedvc_cfm_steps = args.cfm_steps;
+    let cosyvoice_context_s = args.cosyvoice_context_s;
+    let cosyvoice_crossfade_ms = args.cosyvoice_crossfade_ms;
     // Window default per device (issue #42 knee search): CUDA absorbs
     // the official 2400 ms window (~4x fewer decoder needles, worst hop
     // ~43 ms vs the 240 ms deadline); CPU cannot and keeps 640 ms.
@@ -1876,6 +1916,8 @@ fn main() -> anyhow::Result<()> {
                 return run_cosyvoice_conversion(
                     engine,
                     ref_16k,
+                    cosyvoice_context_s,
+                    cosyvoice_crossfade_ms,
                     mic_input,
                     rx_in,
                     tx_out,

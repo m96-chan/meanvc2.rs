@@ -122,9 +122,16 @@ cargo run --release -p babiniku --features cuda --bin babiniku -- \
   (per-hop RMS/spectral inspection), `speaker_sim_probe` (CAM++
   cosine-similarity check: does the output actually move toward the
   reference?), `ref_align_probe` (prompt token/mel frame-count
-  self-consistency).
-- Block/context/crossfade are tuned via `cosyvoice::StreamConfig`
-  (no CLI knob yet — see issue #75 for follow-ups).
+  self-consistency), `similarity_over_time` / `pairwise_similarity`
+  (per-window CAM++ trace and self-consistency matrix — field-debugging
+  a recorded session), `context_ab` (A/B two `context` values on the
+  same material).
+- `--cosyvoice-context-s <seconds>` (default 3.0) and
+  `--cosyvoice-crossfade-ms <ms>` (default 80) override
+  `cosyvoice::StreamConfig` from the CLI. More context can stabilize
+  speaker conditioning on harder material at roughly proportional extra
+  compute per hop — field-tested mixed results (§below), not a
+  guaranteed win.
 
 ## Performance (RTX-class GPU, fp32)
 
@@ -190,6 +197,15 @@ Not a discrete bug to fix; a characteristic to keep tuning around
 (candidates: larger `context`, a cleaner/more expressive reference
 clip, or revisiting whether Seed-VC's DiT line is simply more robust
 here).
+
+**`context` A/B (same field report):** tested 3.0 s (default) vs. 6.0 s
+on noisy material with `context_ab` — mean similarity barely moved
+(0.673 → 0.679) but the worst-case dip improved (0.500 → 0.569) *and*
+a couple of previously-fine windows got mildly worse at 6.0 s. Net:
+inconsistent, not a clear win, at ~2× the compute per hop. Shipped
+`--cosyvoice-context-s`/`--cosyvoice-crossfade-ms` anyway so this is a
+quick CLI experiment rather than a rebuild — worth trying per-reference
+material, but don't expect it to be a decisive fix on its own.
 
 ## Citation
 
