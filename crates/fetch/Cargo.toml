@@ -16,3 +16,8 @@ path = "src/main.rs"
 candle-core = { workspace = true }
 hf-hub = "0.4"
 anyhow = "1"
+# Direct HTTPS downloads for checkpoints not mirrored on Hugging Face
+# (torchaudio's HuBERT-large hub URL, Amphion's repo-checked-in norm
+# stats) — already in the dependency tree transitively via hf-hub.
+ureq = "2"
+zip = { version = "8", default-features = false, features = ["deflate"] }

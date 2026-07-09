@@ -7,7 +7,7 @@
 //! Python by design (they must run the official implementations).
 //!
 //! ```sh
-//! babiniku-fetch seedvc [--ckpt-dir <dir>] [--yes]
+//! babiniku-fetch <seedvc|vevo> [--ckpt-dir <dir>] [--yes]
 //! ```
 //!
 //! Nested-checkpoint reading relies on the candle fork's recursive
@@ -15,7 +15,7 @@
 //! with dotted keys).
 
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -31,7 +31,7 @@ fn main() -> Result<()> {
             "--ckpt-dir" => ckpt_dir = Some(PathBuf::from(args.next().context("--ckpt-dir <dir>")?)),
             "--yes" | "-y" => yes = true,
             "--help" | "-h" => {
-                println!("usage: babiniku-fetch <seedvc> [--ckpt-dir <dir>] [--yes]");
+                println!("usage: babiniku-fetch <seedvc|vevo> [--ckpt-dir <dir>] [--yes]");
                 return Ok(());
             }
             c if cmd.is_none() && !c.starts_with('-') => cmd = Some(c.to_string()),
@@ -47,8 +47,9 @@ fn main() -> Result<()> {
 
     match cmd.as_deref() {
         Some("seedvc") => fetch_seedvc(&ckpt, yes),
-        Some(other) => bail!("unknown engine {other:?} — supported: seedvc (meanvc/xvc: #65)"),
-        None => bail!("usage: babiniku-fetch <seedvc> [--ckpt-dir <dir>] [--yes]"),
+        Some("vevo") => fetch_vevo(&ckpt, yes),
+        Some(other) => bail!("unknown engine {other:?} — supported: seedvc, vevo (meanvc/xvc: #65)"),
+        None => bail!("usage: babiniku-fetch <seedvc|vevo> [--ckpt-dir <dir>] [--yes]"),
     }
 }
 
@@ -86,6 +87,93 @@ fn confirm_gpl(yes: bool) -> Result<()> {
         bail!("aborted");
     }
     Ok(())
+}
+
+/// `crates/vevo` is MIT OR Apache-2.0 (Amphion's code is MIT — no
+/// GPL-style crate gate needed), but the released **weights** are
+/// CC-BY-NC-4.0. This prompt is the enforcement point: local/personal
+/// use is unaffected, but distributing anything built from these
+/// weights carries the NonCommercial restriction (see crates/vevo and
+/// docs/vevo.md).
+fn confirm_nc(yes: bool) -> Result<()> {
+    eprintln!("Vevo (Amphion) weights are CC-BY-NC-4.0. The vevo crate's code");
+    eprintln!("is MIT OR Apache-2.0, but these specific weights — and anything");
+    eprintln!("you produce with them — are licensed for non-commercial use only.");
+    if yes {
+        return Ok(());
+    }
+    eprint!("continue? [y/N] ");
+    std::io::stderr().flush().ok();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    if !matches!(line.trim(), "y" | "Y" | "yes") {
+        bail!("aborted");
+    }
+    Ok(())
+}
+
+/// Plain HTTPS download for checkpoints not mirrored on Hugging Face
+/// (torchaudio's model hub, a file checked into a GitHub repo).
+fn download(url: &str) -> Result<Vec<u8>> {
+    eprintln!("fetching {url} …");
+    let resp = ureq::get(url).call().with_context(|| format!("GET {url}"))?;
+    let mut buf = Vec::new();
+    resp.into_reader().read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+/// Reads a 1-D little-endian float32 `.npy` array (the only shape/dtype
+/// this tool needs): magic, version, header dict, then raw data.
+fn read_npy_f32(bytes: &[u8]) -> Result<Vec<f32>> {
+    if &bytes[..6] != b"\x93NUMPY" {
+        bail!("not an .npy file");
+    }
+    let major = bytes[6];
+    let (header_len, header_start) = if major >= 2 {
+        (u32::from_le_bytes(bytes[8..12].try_into()?) as usize, 12)
+    } else {
+        (u16::from_le_bytes(bytes[8..10].try_into()?) as usize, 10)
+    };
+    let header = std::str::from_utf8(&bytes[header_start..header_start + header_len])?;
+    if !header.contains("'<f4'") {
+        bail!("expected '<f4' dtype, got header {header:?}");
+    }
+    let data = &bytes[header_start + header_len..];
+    Ok(data
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect())
+}
+
+/// Reads `mean.npy`/`std.npy` out of an `.npz` (a plain zip archive).
+fn read_npz_mean_std(bytes: &[u8]) -> Result<(Vec<f32>, Vec<f32>)> {
+    let reader = std::io::Cursor::new(bytes);
+    let mut zip = zip::ZipArchive::new(reader)?;
+    let read_member = |zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>, name: &str| -> Result<Vec<f32>> {
+        let mut f = zip.by_name(name).with_context(|| format!("{name} missing from npz"))?;
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf)?;
+        read_npy_f32(&buf)
+    };
+    let mean = read_member(&mut zip, "mean.npy")?;
+    let std = read_member(&mut zip, "std.npy")?;
+    Ok((mean, std))
+}
+
+/// Folds a weight-normalized tensor where `dim` is the **kept**
+/// dimension (magnitude `g` varies along `dim`, the L2 norm is taken
+/// over every other dimension) — the convention
+/// `nn.utils.parametrizations.weight_norm(conv, dim=2)` uses for
+/// torchaudio's HuBERT positional-conv embedding. This differs from
+/// [`fold_weight_norm`]'s dim-0 convention (BigVGAN, RepCodec).
+fn fold_weight_norm_dim(v: &Tensor, g: &Tensor, dim: usize) -> Result<Tensor> {
+    let other_dims: Vec<usize> = (0..v.dims().len()).filter(|&d| d != dim).collect();
+    let mut norm = v.sqr()?;
+    for d in other_dims {
+        norm = norm.sum_keepdim(d)?;
+    }
+    let norm = norm.sqrt()?;
+    Ok(v.broadcast_mul(&g.broadcast_div(&norm)?)?)
 }
 
 fn hf_file(repo: &str, file: &str) -> Result<PathBuf> {
@@ -195,6 +283,116 @@ fn fetch_seedvc(ckpt: &Path, yes: bool) -> Result<()> {
     Ok(())
 }
 
+/// HF safetensors repos hold multiple checkpoints under subfolders
+/// (`tokenizer/vq8192/model.safetensors`, etc); loads one, keeping
+/// only keys under `prefix` (stripped) when given, dropping the rest.
+fn read_safetensors_prefix(path: &Path, prefix: Option<&str>, exclude_prefix: Option<&str>) -> Result<HashMap<String, Tensor>> {
+    let all = candle_core::safetensors::load(path, &Device::Cpu)?;
+    let mut out = HashMap::new();
+    for (name, t) in all {
+        if let Some(ex) = exclude_prefix {
+            if name.starts_with(ex) {
+                continue;
+            }
+        }
+        let name = match prefix {
+            Some(p) => match name.strip_prefix(p) {
+                Some(rest) => rest.to_string(),
+                None => continue,
+            },
+            None => name,
+        };
+        out.insert(name, t.to_dtype(DType::F32)?);
+    }
+    Ok(out)
+}
+
+fn fetch_vevo(ckpt: &Path, yes: bool) -> Result<()> {
+    confirm_nc(yes)?;
+
+    // ---- HuBERT-large layer-18 extractor (torchaudio's hub, NOT on HF) ----
+    let bytes = download("https://download.pytorch.org/torchaudio/models/hubert_fairseq_large_ll60k.pth")?;
+    let tmp = ckpt.join("_dl_hubert.pth");
+    std::fs::write(&tmp, &bytes)?;
+    // Unlike the Python-side `state_dict()` (wrapped by torchaudio's
+    // `_Wav2Vec2Model`, prefixing every key with "model."), the raw
+    // checkpoint on torch hub is the *inner* `Wav2Vec2Model`'s state
+    // dict directly — no prefix to strip.
+    let mut raw = read_pth(&tmp, None)?;
+    std::fs::remove_file(&tmp).ok();
+
+    // pos_conv_embed weight-norm uses dim=2 (magnitude per kernel
+    // position), unlike every other weight-normed conv in this
+    // codebase — fold before filtering the rest.
+    let g = raw
+        .remove("encoder.transformer.pos_conv_embed.conv.weight_g")
+        .context("missing pos_conv g")?;
+    let v = raw
+        .remove("encoder.transformer.pos_conv_embed.conv.weight_v")
+        .context("missing pos_conv v")?;
+    raw.insert(
+        "encoder.transformer.pos_conv_embed.conv.weight".to_string(),
+        fold_weight_norm_dim(&v, &g, 2)?,
+    );
+
+    const NUM_LAYERS: usize = 18; // Vevo only ever reads layer 18 of 24.
+    let mut hubert = HashMap::new();
+    for (k, v) in raw {
+        if let Some(rest) = k.strip_prefix("encoder.transformer.layers.") {
+            let idx: usize = rest.split('.').next().unwrap().parse()?;
+            if idx >= NUM_LAYERS {
+                continue;
+            }
+        }
+        // torchaudio's Transformer-level `layer_norm` is never applied
+        // on the extract_features()/get_intermediate_outputs() path
+        // HUBERT_LARGE uses (layer_norm_first=False at the Transformer
+        // level, distinct from each EncoderLayer's own True) — dead
+        // weight for this port, see crates/vevo/src/hubert.rs.
+        if k == "encoder.transformer.layer_norm.weight" || k == "encoder.transformer.layer_norm.bias" {
+            continue;
+        }
+        hubert.insert(k, v);
+    }
+    save(&hubert, &ckpt.join("vevo_hubert.safetensors"))?;
+
+    // ---- HuBERT layer-18 z-norm stats (checked into the Amphion repo) ----
+    let npz = download("https://raw.githubusercontent.com/open-mmlab/Amphion/main/models/vc/vevo/config/hubert_large_l18_mean_std.npz")?;
+    let (mean, std) = read_npz_mean_std(&npz)?;
+    let dev = Device::Cpu;
+    let stats = HashMap::from([
+        ("mean".to_string(), Tensor::from_vec(mean, 1024, &dev)?),
+        ("std".to_string(), Tensor::from_vec(std, 1024, &dev)?),
+    ]);
+    save(&stats, &ckpt.join("vevo_hubert_stats.safetensors"))?;
+
+    // ---- RepCodec fvq8192 content-style tokenizer (encoder + VQ only —
+    // the decoder half is dead weight for inference_fm, see crates/vevo). ----
+    let rc = hf_file("amphion/Vevo", "tokenizer/vq8192/model.safetensors")?;
+    let mut repcodec = read_safetensors_prefix(&rc, None, Some("decoder."))?;
+    let vq_g = repcodec.remove("quantizer.quantizers.0.in_project.weight_g").context("missing repcodec in_project.weight_g")?;
+    let vq_v = repcodec.remove("quantizer.quantizers.0.in_project.weight_v").context("missing repcodec in_project.weight_v")?;
+    let vq_b = repcodec.remove("quantizer.quantizers.0.in_project.bias").context("missing repcodec in_project.bias")?;
+    let vq_cb = repcodec.remove("quantizer.quantizers.0.codebook.weight").context("missing repcodec codebook")?;
+    repcodec.retain(|k, _| !k.starts_with("quantizer.quantizers.0.") && !k.starts_with("decoder."));
+    let folded = fold_weight_norm_dim(&vq_v, &vq_g, 0)?.squeeze(2)?; // [8, 1024, 1] -> [8, 1024]
+    repcodec.insert("quantizer.in_project.weight".to_string(), folded);
+    repcodec.insert("quantizer.in_project.bias".to_string(), vq_b);
+    repcodec.insert("quantizer.codebook.weight".to_string(), vq_cb);
+    save(&repcodec, &ckpt.join("vevo_repcodec.safetensors"))?;
+
+    // ---- FM DiffLlama converter (plain fp32, no folding needed) ----
+    let fm = hf_file("amphion/Vevo", "acoustic_modeling/Vq8192ToMels/model.safetensors")?;
+    save(&read_safetensors_prefix(&fm, None, None)?, &ckpt.join("vevo_fmt.safetensors"))?;
+
+    // ---- Vocos vocoder (plain fp32, no folding needed) ----
+    let voc = hf_file("amphion/Vevo", "acoustic_modeling/Vocoder/model.safetensors")?;
+    save(&read_safetensors_prefix(&voc, None, None)?, &ckpt.join("vevo_vocos.safetensors"))?;
+
+    eprintln!("vevo checkpoints ready under {}", ckpt.display());
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,6 +418,50 @@ mod tests {
         for (a, b) in w.iter().zip(want) {
             assert!((a - b).abs() < 1e-6, "{a} vs {b}");
         }
+    }
+
+    #[test]
+    fn weight_norm_fold_dim_matches_hubert_pos_conv_semantics() {
+        // dim=2 (kept dim): g varies along dim 2 only, norm is taken
+        // over dims (0, 1) for each dim-2 slice independently — the
+        // convention torchaudio's HuBERT positional conv embedding
+        // uses (`weight_norm(conv, dim=2)`), distinct from
+        // fold_weight_norm's dim-0 convention.
+        let dev = Device::Cpu;
+        // v: [2, 2, 2], two "kernel positions" (last dim) each with a
+        // 2x2 block. Position 0: (3,4,0,0) -> norm 5. Position 1:
+        // (0,0,6,8) -> norm 10.
+        let v = Tensor::from_vec(vec![3f32, 0.0, 4.0, 0.0, 0.0, 6.0, 0.0, 8.0], (2, 2, 2), &dev).unwrap();
+        let g = Tensor::from_vec(vec![10f32, 1.0], (1, 1, 2), &dev).unwrap();
+        let w = fold_weight_norm_dim(&v, &g, 2).unwrap();
+        let got: Vec<f32> = w.flatten_all().unwrap().to_vec1().unwrap();
+        // position 0 scaled by 10/5=2, position 1 scaled by 1/10=0.1.
+        let want = [6.0f32, 0.0, 8.0, 0.0, 0.0, 0.6, 0.0, 0.8];
+        for (a, b) in got.iter().zip(want) {
+            assert!((a - b).abs() < 1e-6, "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn npy_f32_roundtrip() {
+        // Minimal handwritten .npy: magic + v1.0 header + 3 f32s.
+        let header = "{'descr': '<f4', 'fortran_order': False, 'shape': (3,), }";
+        let mut padded = header.to_string();
+        // npy pads the header so data starts at a 64-byte boundary,
+        // total-header-including-padding ending in '\n'.
+        let prefix_len = 10; // magic(6) + version(2) + header_len(2)
+        while (prefix_len + padded.len() + 1) % 64 != 0 {
+            padded.push(' ');
+        }
+        padded.push('\n');
+        let mut bytes = b"\x93NUMPY\x01\x00".to_vec();
+        bytes.extend_from_slice(&(padded.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(padded.as_bytes());
+        for v in [1.0f32, -2.5, 3.25] {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let got = read_npy_f32(&bytes).unwrap();
+        assert_eq!(got, vec![1.0, -2.5, 3.25]);
     }
 
     #[test]
