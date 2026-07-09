@@ -118,7 +118,11 @@ cargo run --release -p babiniku --features cuda --bin babiniku -- \
 
 - Golden fixtures for development: `tools/gen_cosyvoice_fixtures.py`
   (runs the official implementation — per CLAUDE.md it stays Python by
-  design). Debug/bench example: `offline_convert`.
+  design). Debug/bench examples: `offline_convert`, `stream_tail_probe`
+  (per-hop RMS/spectral inspection), `speaker_sim_probe` (CAM++
+  cosine-similarity check: does the output actually move toward the
+  reference?), `ref_align_probe` (prompt token/mel frame-count
+  self-consistency).
 - Block/context/crossfade are tuned via `cosyvoice::StreamConfig`
   (no CLI knob yet — see issue #75 for follow-ups).
 
@@ -127,11 +131,39 @@ cargo run --release -p babiniku --features cuda --bin babiniku -- \
 | mode | measured (RTX 5090) |
 |---|---|
 | offline (`offline_convert`) | RTF ≈ 0.12–0.17 |
-| streaming, 1.0 s block, 3.0 s context | RTF ≈ 0.27–0.29 per hop, `late 0` |
+| streaming, 1.0 s block, 3.0 s context | RTF ≈ 0.27–0.4 per hop, `late 0` |
 | algorithmic latency | ~1.0 s block + 80 ms crossfade |
 
 CPU is **not** real-time (RTF 1.3+ offline, ~5 streaming); `meanvc`
 remains the CPU baseline and `xvc` the low-latency CUDA alternative.
+
+GPU load is genuinely higher than a minimal design: the flow reruns
+CFM over the **whole** `context + block` window every hop (§Streaming
+above) — roughly 4× the compute a hop-incremental design would need.
+This is a real, current cost of the sliding-window approach, not a
+leak; lowering `context` in `StreamConfig` trades this down at the
+cost of encoder/tokenizer stability at the block boundary (no CLI knob
+yet, see issue #75).
+
+**Speaker-similarity check (field report 2026-07):** a report that
+converted output "sounds natural but far from the reference" led to a
+quantitative check with `speaker_sim_probe` — CAM++ embedding cosine
+similarity between the converted output and the reference vs. the
+original source. On a cross-gender pair (F19→M06 JVS clips), output-vs-
+reference similarity was **0.72–0.74** against a 0.06 source-vs-
+reference baseline — i.e. speaker conditioning is demonstrably pulling
+the output strongly toward the target, both offline and through the
+live TUI streaming path. A real (if minor) self-consistency bug was
+found and fixed along the way — `feat_len()` could drift a frame or two
+from `tokens_len() * 2` since the two are computed via independently
+resampled/STFT'd signals, shifting the prompt/source boundary
+`Flow::cfm` expects — but it was not large enough to explain the
+report. **Current read: CosyVoice2's zero-shot speaker-cloning fidelity
+in this VC path is probably inherently weaker than Seed-VC's** (never
+formally A/B'd for timbre similarity in the #71 recon, which focused on
+needle-scanning and RTF); a longer/cleaner reference clip and a direct
+`--engine seedvc` comparison on the same material are the next things
+to try. Not chasing this further as a "bug" without more field data.
 
 ## Citation
 

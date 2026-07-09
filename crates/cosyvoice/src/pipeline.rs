@@ -38,6 +38,22 @@ pub struct Reference {
     pub(crate) feat: Tensor,
 }
 
+impl Reference {
+    /// Number of FSQ speech tokens (25 Hz).
+    pub fn tokens_len(&self) -> usize {
+        self.tokens.dim(1).unwrap()
+    }
+
+    /// Number of 24 kHz mel frames in the prompt feat (should equal
+    /// `tokens_len() * 2` — the flow's `token_mel_ratio` — for the
+    /// encoder's prompt/source split inside [`Flow::cfm`] to land on the
+    /// intended boundary; see `crate::pipeline` module docs for what
+    /// happens when it doesn't).
+    pub fn feat_len(&self) -> usize {
+        self.feat.dim(1).unwrap()
+    }
+}
+
 /// The full CosyVoice2 VC engine: tokenizer + CAM++ + flow + HiFT.
 pub struct CosyVoiceEngine {
     mel: MelFrontend,
@@ -83,6 +99,17 @@ impl CosyVoiceEngine {
         &self.hift
     }
 
+    /// Raw CAM++ speaker embedding for arbitrary 16 kHz audio (192-d,
+    /// pre-projection) — a debugging/diagnostic hook for checking
+    /// speaker similarity independent of the flow/HiFT pipeline; not
+    /// used by [`Self::prepare_reference`] or [`Self::convert_offline`]
+    /// (those call the same underlying stages directly).
+    pub fn embed_for_debug(&self, audio_16k: &[f32]) -> Result<Vec<f32>> {
+        let fbank = kaldi_fbank80(audio_16k, &self.device)?;
+        let emb = self.campplus.embed(&fbank)?;
+        Ok(emb.flatten_all()?.to_vec1::<f32>()?)
+    }
+
     /// Precompute everything the flow needs from a reference speaker's
     /// audio (any sample rate; resampled internally to 16 kHz / 24 kHz).
     pub fn prepare_reference(&self, audio: &[f32], sr: u32) -> Result<Reference> {
@@ -91,7 +118,28 @@ impl CosyVoiceEngine {
         let tokens = self.tokenize(&audio_16k)?;
         let fbank = kaldi_fbank80(&audio_16k, &self.device)?;
         let embedding = self.campplus.embed(&fbank)?;
-        let feat = self.mel.hifigan_mel80(&audio_24k, &self.device)?;
+        let mut feat = self.mel.hifigan_mel80(&audio_24k, &self.device)?;
+
+        // `tokens` (16 kHz path) and `feat` (24 kHz path) are computed by
+        // two independently-resampled/STFT'd signals, so their frame
+        // counts can drift by a frame or two from the `token_mel_ratio`
+        // (2) the official model was trained under — `Flow::cfm` locates
+        // the prompt/source boundary in `mu` at exactly
+        // `tokens.len() * 2`, so any drift here shifts that boundary.
+        // Snap `feat` to the exact expected length (pad by repeating the
+        // last frame, or trim) rather than let it silently disagree.
+        let want = tokens.dim(1)? * crate::TOKEN_MEL_RATIO;
+        let have = feat.dim(1)?;
+        if have < want {
+            let last = feat.narrow(1, have - 1, 1)?;
+            let pad = last
+                .broadcast_as((1, want - have, feat.dim(2)?))?
+                .contiguous()?;
+            feat = Tensor::cat(&[&feat, &pad], 1)?;
+        } else if have > want {
+            feat = feat.narrow(1, 0, want)?;
+        }
+
         Ok(Reference {
             tokens,
             embedding,
