@@ -22,3 +22,4 @@ pub mod fmt;
 pub mod hubert;
 pub mod mel;
 pub mod repcodec;
+pub mod vocos;
