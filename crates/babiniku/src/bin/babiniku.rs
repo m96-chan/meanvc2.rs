@@ -963,6 +963,7 @@ fn run_cosyvoice_conversion(
     let mut deep_for = 0u32;
     let mut hops = 0u64;
     let mut was_passthrough = false;
+    let mut prev_gated = false;
 
     while run.load(Ordering::Relaxed) {
         let chunk = match rx_in.recv_timeout(Duration::from_millis(50)) {
@@ -988,6 +989,7 @@ fn run_cosyvoice_conversion(
             hp = HighpassBiquad::new(SR as f64, 40.0);
             expander = SoftExpander::new(SR as f32);
             was_passthrough = false;
+            prev_gated = false;
         }
 
         let gate = controls.gate_db.load(Ordering::Relaxed);
@@ -1013,6 +1015,32 @@ fn run_cosyvoice_conversion(
         };
         expander.process(&mut prepared, open_for > 0);
 
+        // Splice fade at hard-gate transitions (same pattern as the X-VC
+        // path): fading the model's INPUT lets the flow/HiFT settle
+        // toward silence smoothly on the edge chunk, instead of jumping
+        // straight from converted audio to a digital-zero block — with
+        // CosyVoice2's 1.0 s block granularity (vs X-VC's 240 ms /
+        // Seed-VC's 320 ms) an unfaded hard mute is a full second of
+        // audible pop, not a click.
+        const SPLICE_FADE: usize = 1_600; // 100 ms at 16 kHz
+        let entering_gate = gated && !prev_gated;
+        let leaving_gate = !gated && prev_gated;
+        prev_gated = gated;
+        if entering_gate {
+            stats.lock().unwrap().splices += 1;
+            let n = SPLICE_FADE.min(prepared.len());
+            for (i, s) in prepared.iter_mut().take(n).enumerate() {
+                let w = 1.0 - i as f32 / n as f32;
+                *s *= w * w;
+            }
+        } else if leaving_gate {
+            let n = SPLICE_FADE.min(prepared.len());
+            for (i, s) in prepared.iter_mut().take(n).enumerate() {
+                let w = i as f32 / n as f32;
+                *s *= w * w;
+            }
+        }
+
         {
             let mut st = stats.lock().unwrap();
             st.in_rms = in_level;
@@ -1021,9 +1049,11 @@ fn run_cosyvoice_conversion(
                 st.gated += 1;
             }
         }
-        if gated {
-            // Deep silence: skip the model entirely, emit zeros at the
-            // engine's native output rate (24 kHz per input sample = 1.5x).
+        // Steady-state deep silence (not the fade-out edge): skip the
+        // model entirely, emit true zeros at the engine's native output
+        // rate. The edge chunk (entering_gate) still runs through the
+        // model below so the fade above actually reaches the speaker.
+        if gated && !entering_gate {
             let n = prepared.len() * cosyvoice::MEL_SR as usize / SR;
             let _ = tx_out.send(OutMsg::Raw48(vec![0.0; n]));
             continue;
