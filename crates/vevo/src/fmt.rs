@@ -51,7 +51,12 @@ struct Mlp3 {
 }
 
 impl Mlp3 {
-    fn new(in_dim: usize, hidden: usize, out_dim: usize, vb: VarBuilder) -> candle_core::Result<Self> {
+    fn new(
+        in_dim: usize,
+        hidden: usize,
+        out_dim: usize,
+        vb: VarBuilder,
+    ) -> candle_core::Result<Self> {
         Ok(Self {
             fc1: linear(in_dim, hidden, vb.pp("0"))?,
             fc2: linear(hidden, out_dim, vb.pp("2"))?,
@@ -114,7 +119,12 @@ impl LlamaMlp {
 /// convention used elsewhere in this workspace): `cos`/`sin` cover the
 /// full head dim (each of the `d/2` frequencies duplicated into both
 /// halves), and `rotate_half(x) = cat(-x[d/2:], x[:d/2])`.
-fn rope_tables(t_len: usize, head_dim: usize, theta: f64, dev: &Device) -> candle_core::Result<(Tensor, Tensor)> {
+fn rope_tables(
+    t_len: usize,
+    head_dim: usize,
+    theta: f64,
+    dev: &Device,
+) -> candle_core::Result<(Tensor, Tensor)> {
     let half = head_dim / 2;
     let inv_freq: Vec<f32> = (0..half)
         .map(|i| (1.0 / theta.powf(2.0 * i as f64 / head_dim as f64)) as f32)
@@ -179,9 +189,24 @@ impl SelfAttn {
     fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> candle_core::Result<Tensor> {
         let (b, t, d) = x.dims3()?;
         let shape = (b, t, self.num_heads, self.head_dim);
-        let q = self.q.forward(x)?.reshape(shape)?.transpose(1, 2)?.contiguous()?;
-        let k = self.k.forward(x)?.reshape(shape)?.transpose(1, 2)?.contiguous()?;
-        let v = self.v.forward(x)?.reshape(shape)?.transpose(1, 2)?.contiguous()?;
+        let q = self
+            .q
+            .forward(x)?
+            .reshape(shape)?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let k = self
+            .k
+            .forward(x)?
+            .reshape(shape)?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let v = self
+            .v
+            .forward(x)?
+            .reshape(shape)?
+            .transpose(1, 2)?
+            .contiguous()?;
         let q = apply_rope(&q, cos, sin)?;
         let k = apply_rope(&k, cos, sin)?;
         let scale = (self.head_dim as f64).powf(-0.5);
@@ -204,7 +229,12 @@ struct NarLayer {
 impl NarLayer {
     fn new(cfg: &FmtConfig, vb: VarBuilder) -> candle_core::Result<Self> {
         Ok(Self {
-            input_ln: AdaRmsNorm::new(cfg.hidden_size, cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?,
+            input_ln: AdaRmsNorm::new(
+                cfg.hidden_size,
+                cfg.hidden_size,
+                cfg.rms_norm_eps,
+                vb.pp("input_layernorm"),
+            )?,
             attn: SelfAttn::new(cfg.hidden_size, cfg.num_heads, vb.pp("self_attn"))?,
             post_attn_ln: AdaRmsNorm::new(
                 cfg.hidden_size,
@@ -216,7 +246,13 @@ impl NarLayer {
         })
     }
 
-    fn forward(&self, x: &Tensor, step: &Tensor, cos: &Tensor, sin: &Tensor) -> candle_core::Result<Tensor> {
+    fn forward(
+        &self,
+        x: &Tensor,
+        step: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+    ) -> candle_core::Result<Tensor> {
         let residual = x;
         let h = self.input_ln.forward(x, step)?;
         let h = self.attn.forward(&h, cos, sin)?;
@@ -249,11 +285,36 @@ impl DiffLlama {
         }
         Ok(Self {
             layers,
-            final_norm: AdaRmsNorm::new(cfg.hidden_size, cfg.hidden_size, cfg.rms_norm_eps, vb.pp("norm"))?,
-            diff_step_mlp: Mlp3::new(cfg.hidden_size, cfg.hidden_size * 4, cfg.hidden_size, vb.pp("diff_step_mlp"))?,
-            cond_mlp: Mlp3::new(cfg.hidden_size, cfg.hidden_size * 4, cfg.hidden_size, vb.pp("cond_mlp"))?,
-            mel_mlp: Mlp3::new(cfg.mel_dim, cfg.hidden_size * 4, cfg.hidden_size, vb.pp("mel_mlp"))?,
-            mel_out_mlp: Mlp3::new(cfg.hidden_size, cfg.hidden_size * 4, cfg.mel_dim, vb.pp("mel_out_mlp"))?,
+            final_norm: AdaRmsNorm::new(
+                cfg.hidden_size,
+                cfg.hidden_size,
+                cfg.rms_norm_eps,
+                vb.pp("norm"),
+            )?,
+            diff_step_mlp: Mlp3::new(
+                cfg.hidden_size,
+                cfg.hidden_size * 4,
+                cfg.hidden_size,
+                vb.pp("diff_step_mlp"),
+            )?,
+            cond_mlp: Mlp3::new(
+                cfg.hidden_size,
+                cfg.hidden_size * 4,
+                cfg.hidden_size,
+                vb.pp("cond_mlp"),
+            )?,
+            mel_mlp: Mlp3::new(
+                cfg.mel_dim,
+                cfg.hidden_size * 4,
+                cfg.hidden_size,
+                vb.pp("mel_mlp"),
+            )?,
+            mel_out_mlp: Mlp3::new(
+                cfg.hidden_size,
+                cfg.hidden_size * 4,
+                cfg.mel_dim,
+                vb.pp("mel_out_mlp"),
+            )?,
             hidden_size: cfg.hidden_size,
             num_heads: cfg.num_heads,
             rope_theta: cfg.rope_theta,
@@ -275,7 +336,12 @@ impl DiffLlama {
     }
 
     /// `x`: `[b, t, mel_dim]`, `diffusion_step`: `[b]`, `cond`: `[b, t, hidden]`.
-    pub fn forward(&self, x: &Tensor, diffusion_step: &Tensor, cond: &Tensor) -> candle_core::Result<Tensor> {
+    pub fn forward(
+        &self,
+        x: &Tensor,
+        diffusion_step: &Tensor,
+        cond: &Tensor,
+    ) -> candle_core::Result<Tensor> {
         let cond_embedding = self.cond_mlp.forward(cond)?;
         let x = self.mel_mlp.forward(x)?;
         let step_emb = self.diff_step_embedding(diffusion_step)?;
@@ -307,7 +373,11 @@ impl FlowMatchingTransformer {
         })
     }
 
-    pub fn load<P: AsRef<std::path::Path>>(cfg: &FmtConfig, path: P, device: &Device) -> Result<Self> {
+    pub fn load<P: AsRef<std::path::Path>>(
+        cfg: &FmtConfig,
+        path: P,
+        device: &Device,
+    ) -> Result<Self> {
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[path], DType::F32, device)? };
         Self::new(cfg, vb).map_err(Into::into)
     }
@@ -355,7 +425,8 @@ impl FlowMatchingTransformer {
                 let uncond = cond_target.zeros_like()?;
                 let uncond_flow_pred = self.diff_estimator.forward(&xt, &t, &uncond)?;
                 let pos_std = std_all(&flow_pred)?;
-                let flow_pred_cfg = (&flow_pred + ((&flow_pred - &uncond_flow_pred)? * cfg_scale)?)?;
+                let flow_pred_cfg =
+                    (&flow_pred + ((&flow_pred - &uncond_flow_pred)? * cfg_scale)?)?;
                 let cfg_std = std_all(&flow_pred_cfg)?;
                 let rescaled = (&flow_pred_cfg * (pos_std / cfg_std))?;
                 flow_pred = ((&rescaled * rescale_cfg)? + (&flow_pred_cfg * (1.0 - rescale_cfg))?)?;
@@ -396,7 +467,8 @@ mod tests {
     }
 
     fn ckpt() -> Option<std::path::PathBuf> {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ckpt/vevo_fmt.safetensors");
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../ckpt/vevo_fmt.safetensors");
         path.exists().then_some(path)
     }
 

@@ -28,7 +28,9 @@ fn main() -> Result<()> {
     let mut yes = false;
     while let Some(a) = args.next() {
         match a.as_str() {
-            "--ckpt-dir" => ckpt_dir = Some(PathBuf::from(args.next().context("--ckpt-dir <dir>")?)),
+            "--ckpt-dir" => {
+                ckpt_dir = Some(PathBuf::from(args.next().context("--ckpt-dir <dir>")?))
+            }
             "--yes" | "-y" => yes = true,
             "--help" | "-h" => {
                 println!("usage: babiniku-fetch <seedvc|vevo> [--ckpt-dir <dir>] [--yes]");
@@ -42,13 +44,14 @@ fn main() -> Result<()> {
         Some(d) => d,
         None => default_ckpt_dir()?,
     };
-    std::fs::create_dir_all(&ckpt)
-        .with_context(|| format!("cannot create {}", ckpt.display()))?;
+    std::fs::create_dir_all(&ckpt).with_context(|| format!("cannot create {}", ckpt.display()))?;
 
     match cmd.as_deref() {
         Some("seedvc") => fetch_seedvc(&ckpt, yes),
         Some("vevo") => fetch_vevo(&ckpt, yes),
-        Some(other) => bail!("unknown engine {other:?} — supported: seedvc, vevo (meanvc/xvc: #65)"),
+        Some(other) => {
+            bail!("unknown engine {other:?} — supported: seedvc, vevo (meanvc/xvc: #65)")
+        }
         None => bail!("usage: babiniku-fetch <seedvc|vevo> [--ckpt-dir <dir>] [--yes]"),
     }
 }
@@ -69,7 +72,9 @@ fn default_ckpt_dir() -> Result<PathBuf> {
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
     };
-    Ok(base.context("cannot determine a data directory")?.join("babiniku/ckpt"))
+    Ok(base
+        .context("cannot determine a data directory")?
+        .join("babiniku/ckpt"))
 }
 
 fn confirm_gpl(yes: bool) -> Result<()> {
@@ -116,7 +121,9 @@ fn confirm_nc(yes: bool) -> Result<()> {
 /// (torchaudio's model hub, a file checked into a GitHub repo).
 fn download(url: &str) -> Result<Vec<u8>> {
     eprintln!("fetching {url} …");
-    let resp = ureq::get(url).call().with_context(|| format!("GET {url}"))?;
+    let resp = ureq::get(url)
+        .call()
+        .with_context(|| format!("GET {url}"))?;
     let mut buf = Vec::new();
     resp.into_reader().read_to_end(&mut buf)?;
     Ok(buf)
@@ -149,12 +156,15 @@ fn read_npy_f32(bytes: &[u8]) -> Result<Vec<f32>> {
 fn read_npz_mean_std(bytes: &[u8]) -> Result<(Vec<f32>, Vec<f32>)> {
     let reader = std::io::Cursor::new(bytes);
     let mut zip = zip::ZipArchive::new(reader)?;
-    let read_member = |zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>, name: &str| -> Result<Vec<f32>> {
-        let mut f = zip.by_name(name).with_context(|| format!("{name} missing from npz"))?;
-        let mut buf = Vec::new();
-        f.read_to_end(&mut buf)?;
-        read_npy_f32(&buf)
-    };
+    let read_member =
+        |zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>, name: &str| -> Result<Vec<f32>> {
+            let mut f = zip
+                .by_name(name)
+                .with_context(|| format!("{name} missing from npz"))?;
+            let mut buf = Vec::new();
+            f.read_to_end(&mut buf)?;
+            read_npy_f32(&buf)
+        };
     let mean = read_member(&mut zip, "mean.npy")?;
     let std = read_member(&mut zip, "std.npy")?;
     Ok((mean, std))
@@ -253,7 +263,10 @@ fn fetch_seedvc(ckpt: &Path, yes: bool) -> Result<()> {
         "Plachta/Seed-VC",
         "DiT_seed_v2_uvit_whisper_small_wavenet_bigvgan_pruned.pth",
     )?;
-    save(&read_pth(&main, Some("net.cfm."))?, &ckpt.join("seedvc_dit.safetensors"))?;
+    save(
+        &read_pth(&main, Some("net.cfm."))?,
+        &ckpt.join("seedvc_dit.safetensors"),
+    )?;
     save(
         &read_pth(&main, Some("net.length_regulator."))?,
         &ckpt.join("seedvc_regulator.safetensors"),
@@ -261,13 +274,21 @@ fn fetch_seedvc(ckpt: &Path, yes: bool) -> Result<()> {
 
     // CAM++ speaker encoder (flat state dict).
     let camp = hf_file("funasr/campplus", "campplus_cn_common.bin")?;
-    save(&read_pth(&camp, None)?, &ckpt.join("seedvc_campplus.safetensors"))?;
+    save(
+        &read_pth(&camp, None)?,
+        &ckpt.join("seedvc_campplus.safetensors"),
+    )?;
 
     // BigVGAN v2 vocoder (weight norm folded like remove_weight_norm()).
-    let bv = hf_file("nvidia/bigvgan_v2_22khz_80band_256x", "bigvgan_generator.pt")?;
-    let bv_sd = read_pth(&bv, Some("generator."))
-        .or_else(|_| read_pth(&bv, None))?;
-    save(&fold_weight_norm(bv_sd)?, &ckpt.join("seedvc_bigvgan.safetensors"))?;
+    let bv = hf_file(
+        "nvidia/bigvgan_v2_22khz_80band_256x",
+        "bigvgan_generator.pt",
+    )?;
+    let bv_sd = read_pth(&bv, Some("generator.")).or_else(|_| read_pth(&bv, None))?;
+    save(
+        &fold_weight_norm(bv_sd)?,
+        &ckpt.join("seedvc_bigvgan.safetensors"),
+    )?;
 
     // Whisper-small encoder (already safetensors upstream; subset).
     let wh = hf_file("openai/whisper-small", "model.safetensors")?;
@@ -286,7 +307,11 @@ fn fetch_seedvc(ckpt: &Path, yes: bool) -> Result<()> {
 /// HF safetensors repos hold multiple checkpoints under subfolders
 /// (`tokenizer/vq8192/model.safetensors`, etc); loads one, keeping
 /// only keys under `prefix` (stripped) when given, dropping the rest.
-fn read_safetensors_prefix(path: &Path, prefix: Option<&str>, exclude_prefix: Option<&str>) -> Result<HashMap<String, Tensor>> {
+fn read_safetensors_prefix(
+    path: &Path,
+    prefix: Option<&str>,
+    exclude_prefix: Option<&str>,
+) -> Result<HashMap<String, Tensor>> {
     let all = candle_core::safetensors::load(path, &Device::Cpu)?;
     let mut out = HashMap::new();
     for (name, t) in all {
@@ -311,7 +336,8 @@ fn fetch_vevo(ckpt: &Path, yes: bool) -> Result<()> {
     confirm_nc(yes)?;
 
     // ---- HuBERT-large layer-18 extractor (torchaudio's hub, NOT on HF) ----
-    let bytes = download("https://download.pytorch.org/torchaudio/models/hubert_fairseq_large_ll60k.pth")?;
+    let bytes =
+        download("https://download.pytorch.org/torchaudio/models/hubert_fairseq_large_ll60k.pth")?;
     let tmp = ckpt.join("_dl_hubert.pth");
     std::fs::write(&tmp, &bytes)?;
     // Unlike the Python-side `state_dict()` (wrapped by torchaudio's
@@ -349,7 +375,9 @@ fn fetch_vevo(ckpt: &Path, yes: bool) -> Result<()> {
         // HUBERT_LARGE uses (layer_norm_first=False at the Transformer
         // level, distinct from each EncoderLayer's own True) — dead
         // weight for this port, see crates/vevo/src/hubert.rs.
-        if k == "encoder.transformer.layer_norm.weight" || k == "encoder.transformer.layer_norm.bias" {
+        if k == "encoder.transformer.layer_norm.weight"
+            || k == "encoder.transformer.layer_norm.bias"
+        {
             continue;
         }
         hubert.insert(k, v);
@@ -370,10 +398,18 @@ fn fetch_vevo(ckpt: &Path, yes: bool) -> Result<()> {
     // the decoder half is dead weight for inference_fm, see crates/vevo). ----
     let rc = hf_file("amphion/Vevo", "tokenizer/vq8192/model.safetensors")?;
     let mut repcodec = read_safetensors_prefix(&rc, None, Some("decoder."))?;
-    let vq_g = repcodec.remove("quantizer.quantizers.0.in_project.weight_g").context("missing repcodec in_project.weight_g")?;
-    let vq_v = repcodec.remove("quantizer.quantizers.0.in_project.weight_v").context("missing repcodec in_project.weight_v")?;
-    let vq_b = repcodec.remove("quantizer.quantizers.0.in_project.bias").context("missing repcodec in_project.bias")?;
-    let vq_cb = repcodec.remove("quantizer.quantizers.0.codebook.weight").context("missing repcodec codebook")?;
+    let vq_g = repcodec
+        .remove("quantizer.quantizers.0.in_project.weight_g")
+        .context("missing repcodec in_project.weight_g")?;
+    let vq_v = repcodec
+        .remove("quantizer.quantizers.0.in_project.weight_v")
+        .context("missing repcodec in_project.weight_v")?;
+    let vq_b = repcodec
+        .remove("quantizer.quantizers.0.in_project.bias")
+        .context("missing repcodec in_project.bias")?;
+    let vq_cb = repcodec
+        .remove("quantizer.quantizers.0.codebook.weight")
+        .context("missing repcodec codebook")?;
     repcodec.retain(|k, _| !k.starts_with("quantizer.quantizers.0.") && !k.starts_with("decoder."));
     let folded = fold_weight_norm_dim(&vq_v, &vq_g, 0)?.squeeze(2)?; // [8, 1024, 1] -> [8, 1024]
     repcodec.insert("quantizer.in_project.weight".to_string(), folded);
@@ -382,12 +418,24 @@ fn fetch_vevo(ckpt: &Path, yes: bool) -> Result<()> {
     save(&repcodec, &ckpt.join("vevo_repcodec.safetensors"))?;
 
     // ---- FM DiffLlama converter (plain fp32, no folding needed) ----
-    let fm = hf_file("amphion/Vevo", "acoustic_modeling/Vq8192ToMels/model.safetensors")?;
-    save(&read_safetensors_prefix(&fm, None, None)?, &ckpt.join("vevo_fmt.safetensors"))?;
+    let fm = hf_file(
+        "amphion/Vevo",
+        "acoustic_modeling/Vq8192ToMels/model.safetensors",
+    )?;
+    save(
+        &read_safetensors_prefix(&fm, None, None)?,
+        &ckpt.join("vevo_fmt.safetensors"),
+    )?;
 
     // ---- Vocos vocoder (plain fp32, no folding needed) ----
-    let voc = hf_file("amphion/Vevo", "acoustic_modeling/Vocoder/model.safetensors")?;
-    save(&read_safetensors_prefix(&voc, None, None)?, &ckpt.join("vevo_vocos.safetensors"))?;
+    let voc = hf_file(
+        "amphion/Vevo",
+        "acoustic_modeling/Vocoder/model.safetensors",
+    )?;
+    save(
+        &read_safetensors_prefix(&voc, None, None)?,
+        &ckpt.join("vevo_vocos.safetensors"),
+    )?;
 
     eprintln!("vevo checkpoints ready under {}", ckpt.display());
     Ok(())
@@ -407,7 +455,10 @@ mod tests {
         let mut sd = HashMap::new();
         sd.insert("conv.weight_v".to_string(), v);
         sd.insert("conv.weight_g".to_string(), g);
-        sd.insert("conv.bias".to_string(), Tensor::zeros(2, DType::F32, &dev).unwrap());
+        sd.insert(
+            "conv.bias".to_string(),
+            Tensor::zeros(2, DType::F32, &dev).unwrap(),
+        );
         let out = fold_weight_norm(sd).unwrap();
         assert!(out.contains_key("conv.weight"));
         assert!(out.contains_key("conv.bias"));
@@ -431,7 +482,12 @@ mod tests {
         // v: [2, 2, 2], two "kernel positions" (last dim) each with a
         // 2x2 block. Position 0: (3,4,0,0) -> norm 5. Position 1:
         // (0,0,6,8) -> norm 10.
-        let v = Tensor::from_vec(vec![3f32, 0.0, 4.0, 0.0, 0.0, 6.0, 0.0, 8.0], (2, 2, 2), &dev).unwrap();
+        let v = Tensor::from_vec(
+            vec![3f32, 0.0, 4.0, 0.0, 0.0, 6.0, 0.0, 8.0],
+            (2, 2, 2),
+            &dev,
+        )
+        .unwrap();
         let g = Tensor::from_vec(vec![10f32, 1.0], (1, 1, 2), &dev).unwrap();
         let w = fold_weight_norm_dim(&v, &g, 2).unwrap();
         let got: Vec<f32> = w.flatten_all().unwrap().to_vec1().unwrap();

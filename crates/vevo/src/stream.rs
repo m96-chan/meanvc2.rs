@@ -97,7 +97,11 @@ impl VevoEngine {
     /// Precomputes the reference conditions and opens a stream.
     pub fn stream(&self, ref_24k: &[f32], cfg: StreamConfig) -> Result<VevoStream<'_>> {
         let cap = (cfg.max_prompt_s * 24_000.0) as usize;
-        let ref_24k = if ref_24k.len() > cap { &ref_24k[..cap] } else { ref_24k };
+        let ref_24k = if ref_24k.len() > cap {
+            &ref_24k[..cap]
+        } else {
+            ref_24k
+        };
         let ref16 = resample(ref_24k, 24_000, 16_000);
         let codes = self.content_style_codes(&ref16)?;
         let mel = self.mel_feature(ref_24k)?;
@@ -161,7 +165,10 @@ impl VevoStream<'_> {
         }
         self.pending -= self.cfg.block;
 
-        let win16 = &self.buf[self.buf.len().saturating_sub(self.cfg.context + self.cfg.block)..];
+        let win16 = &self.buf[self
+            .buf
+            .len()
+            .saturating_sub(self.cfg.context + self.cfg.block)..];
         let win_codes = self.engine.content_style_codes(win16)?;
         let codes = Tensor::cat(&[&self.reference.codes, &win_codes], 1)?;
         let cond = self.engine.fmt.cond_embed(&codes)?;
@@ -177,10 +184,14 @@ impl VevoStream<'_> {
                 n
             }
         };
-        let mel = self
-            .engine
-            .fmt
-            .reverse_diffusion(&cond, &self.reference.mel, noise, self.cfg.steps, 1.0, 0.75)?;
+        let mel = self.engine.fmt.reverse_diffusion(
+            &cond,
+            &self.reference.mel,
+            noise,
+            self.cfg.steps,
+            1.0,
+            0.75,
+        )?;
         let wave24: Vec<f32> = self.engine.vocos.synthesize(&mel)?;
 
         // Emit the tail block (+ crossfade lead-in), 24 kHz domain.
@@ -297,7 +308,9 @@ mod tests {
             let samples: Vec<f32> = match spec.sample_format {
                 hound::SampleFormat::Int => {
                     let scale = (1i64 << (spec.bits_per_sample - 1)) as f32;
-                    r.samples::<i32>().map(|s| s.unwrap() as f32 / scale).collect()
+                    r.samples::<i32>()
+                        .map(|s| s.unwrap() as f32 / scale)
+                        .collect()
                 }
                 hound::SampleFormat::Float => r.samples::<f32>().map(|s| s.unwrap()).collect(),
             };
@@ -329,7 +342,10 @@ mod tests {
             }
         }
         assert!(!out.is_empty(), "no output produced");
-        assert!(out.iter().all(|s| s.is_finite()), "non-finite sample in output");
+        assert!(
+            out.iter().all(|s| s.is_finite()),
+            "non-finite sample in output"
+        );
         let rms = (out.iter().map(|s| s * s).sum::<f32>() / out.len() as f32).sqrt();
         assert!(rms > 1e-4, "output looks silent, rms={rms}");
     }

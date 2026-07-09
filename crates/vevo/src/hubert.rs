@@ -170,9 +170,24 @@ impl EncoderLayer {
         let (b, t, d) = h.dims3()?;
         let hd = d / self.num_heads;
         let shape = (b, t, self.num_heads, hd);
-        let q = self.q.forward(&h)?.reshape(shape)?.transpose(1, 2)?.contiguous()?;
-        let k = self.k.forward(&h)?.reshape(shape)?.transpose(1, 2)?.contiguous()?;
-        let v = self.v.forward(&h)?.reshape(shape)?.transpose(1, 2)?.contiguous()?;
+        let q = self
+            .q
+            .forward(&h)?
+            .reshape(shape)?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let k = self
+            .k
+            .forward(&h)?
+            .reshape(shape)?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let v = self
+            .v
+            .forward(&h)?
+            .reshape(shape)?
+            .transpose(1, 2)?
+            .contiguous()?;
         let scale = (hd as f64).powf(-0.5);
         let attn = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
         let attn = candle_nn::ops::softmax_last_dim(&attn)?;
@@ -234,7 +249,8 @@ impl HubertLarge {
     pub fn new(cfg: &HubertConfig, vb: VarBuilder) -> candle_core::Result<Self> {
         let feature_extractor = FeatureExtractor::new(cfg, vb.pp("feature_extractor"))?;
         let enc = vb.pp("encoder");
-        let feature_projection = FeatureProjection::new(512, cfg.embed_dim, enc.pp("feature_projection"))?;
+        let feature_projection =
+            FeatureProjection::new(512, cfg.embed_dim, enc.pp("feature_projection"))?;
         let tvb = enc.pp("transformer");
         let pos_conv = PosConvEmbed::new(cfg, tvb.pp("pos_conv_embed.conv"))?;
         // NOTE: `encoder.transformer.layer_norm` is intentionally never
@@ -310,7 +326,8 @@ mod tests {
     }
 
     fn ckpt() -> Option<std::path::PathBuf> {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ckpt/vevo_hubert.safetensors");
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../ckpt/vevo_hubert.safetensors");
         path.exists().then_some(path)
     }
 
@@ -324,7 +341,11 @@ mod tests {
         let model = HubertLarge::load(&cfg, ckpt, &dev).unwrap();
 
         let ref_16k = fx["ref_16k"].clone();
-        let want = fx["hubert_ref_raw"].squeeze(0).unwrap().to_vec2::<f32>().unwrap();
+        let want = fx["hubert_ref_raw"]
+            .squeeze(0)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
         let got = model
             .extract_features(&ref_16k)
             .unwrap()

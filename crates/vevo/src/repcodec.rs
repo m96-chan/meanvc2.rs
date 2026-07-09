@@ -68,7 +68,9 @@ impl ConvNeXtBlock {
         let residual = x;
         let x = self.dwconv.forward(x)?.transpose(1, 2)?;
         let x = self.norm.forward(&x)?;
-        let x = self.pwconv2.forward(&self.pwconv1.forward(&x)?.gelu_erf()?)?;
+        let x = self
+            .pwconv2
+            .forward(&self.pwconv1.forward(&x)?.gelu_erf()?)?;
         let x = x.broadcast_mul(&self.gamma)?.transpose(1, 2)?;
         residual + x
     }
@@ -145,8 +147,15 @@ impl RepCodec {
             vb.pp("encoder.0"),
         )?;
         let encoder_proj = linear(cfg.vocos_dim, cfg.hidden_size, vb.pp("encoder.1"))?;
-        let vq_in_project = linear(cfg.hidden_size, cfg.codebook_dim, vb.pp("quantizer.in_project"))?;
-        let codebook = vb.get((cfg.codebook_size, cfg.codebook_dim), "quantizer.codebook.weight")?;
+        let vq_in_project = linear(
+            cfg.hidden_size,
+            cfg.codebook_dim,
+            vb.pp("quantizer.in_project"),
+        )?;
+        let codebook = vb.get(
+            (cfg.codebook_size, cfg.codebook_dim),
+            "quantizer.codebook.weight",
+        )?;
         let codebook = l2_normalize_rows(&codebook)?;
         Ok(Self {
             backbone,
@@ -213,7 +222,8 @@ mod tests {
     }
 
     fn ckpt() -> Option<std::path::PathBuf> {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ckpt/vevo_repcodec.safetensors");
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../ckpt/vevo_repcodec.safetensors");
         path.exists().then_some(path)
     }
 
@@ -249,7 +259,11 @@ mod tests {
         assert_eq!(got.len(), want.len());
         let matches = got.iter().zip(&want).filter(|(a, b)| a == b).count();
         let ratio = matches as f64 / got.len() as f64;
-        assert!(ratio > 0.95, "code match ratio {ratio} ({matches}/{})", got.len());
+        assert!(
+            ratio > 0.95,
+            "code match ratio {ratio} ({matches}/{})",
+            got.len()
+        );
     }
 
     fn cosine_corr(a: &Tensor, b: &Tensor) -> f64 {

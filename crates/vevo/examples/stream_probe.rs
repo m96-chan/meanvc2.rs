@@ -13,13 +13,18 @@ use std::time::Instant;
 use vevo::pipeline::{resample, VevoEngine};
 use vevo::stream::StreamConfig;
 
-fn read_wav(path: &std::path::Path, target_hz: usize) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+fn read_wav(
+    path: &std::path::Path,
+    target_hz: usize,
+) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
     let mut r = hound::WavReader::open(path)?;
     let spec = r.spec();
     let samples: Vec<f32> = match spec.sample_format {
         hound::SampleFormat::Int => {
             let scale = (1i64 << (spec.bits_per_sample - 1)) as f32;
-            r.samples::<i32>().map(|s| s.map(|v| v as f32 / scale)).collect::<Result<_, _>>()?
+            r.samples::<i32>()
+                .map(|s| s.map(|v| v as f32 / scale))
+                .collect::<Result<_, _>>()?
         }
         hound::SampleFormat::Float => r.samples::<f32>().collect::<Result<_, _>>()?,
     };
@@ -47,8 +52,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ref24 = resample(&ref16, 16_000, 24_000);
     let src16 = read_wav(&dir.join("ref_trimmed.wav"), 16_000)?;
 
-    let steps: usize = std::env::var("VEVO_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(StreamConfig::default().steps);
-    let cfg = StreamConfig { steps, ..StreamConfig::default() };
+    let steps: usize = std::env::var("VEVO_STEPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(StreamConfig::default().steps);
+    let cfg = StreamConfig {
+        steps,
+        ..StreamConfig::default()
+    };
     let t0 = Instant::now();
     let mut stream = engine.stream(&ref24, cfg)?;
     println!("reference prep: {:.2}s", t0.elapsed().as_secs_f32());
@@ -65,7 +76,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let dt = t0.elapsed().as_secs_f32();
             n += 1;
             let len = chunk.as_ref().map(|c| c.len()).unwrap_or(0);
-            println!("hop {n}: {dt:.2}s (budget {:.2}s) out {len}", cfg.block as f32 / 16_000.0);
+            println!(
+                "hop {n}: {dt:.2}s (budget {:.2}s) out {len}",
+                cfg.block as f32 / 16_000.0
+            );
             if let Some(c) = chunk {
                 out.extend(c);
             }
@@ -86,6 +100,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         w.write_sample((s.clamp(-1.0, 1.0) * 32767.0) as i16)?;
     }
     w.finalize()?;
-    println!("wrote {} ({} samples, {:.2}s)", out_path.display(), out.len(), out.len() as f32 / 48_000.0);
+    println!(
+        "wrote {} ({} samples, {:.2}s)",
+        out_path.display(),
+        out.len(),
+        out.len() as f32 / 48_000.0
+    );
     Ok(())
 }

@@ -31,7 +31,9 @@ pub fn resample(input: &[f32], orig: usize, new: usize) -> Vec<f32> {
             let j = jj as i64 - kw;
             let t = (-(i as f64) / new_f as f64 + j as f64 / orig_f as f64) * base;
             let t = t.clamp(-(width as f64), width as f64);
-            let win = (t * std::f64::consts::PI / width as f64 / 2.0).cos().powi(2);
+            let win = (t * std::f64::consts::PI / width as f64 / 2.0)
+                .cos()
+                .powi(2);
             let sinc = if t == 0.0 {
                 1.0
             } else {
@@ -84,16 +86,36 @@ impl VevoEngine {
     pub fn load(ckpt: impl AsRef<std::path::Path>, device: &Device) -> Result<Self> {
         let d = ckpt.as_ref();
         let stats = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[d.join("vevo_hubert_stats.safetensors")], DType::F32, device)?
+            VarBuilder::from_mmaped_safetensors(
+                &[d.join("vevo_hubert_stats.safetensors")],
+                DType::F32,
+                device,
+            )?
         };
         Ok(Self {
-            hubert: HubertLarge::load(&HubertConfig::default(), d.join("vevo_hubert.safetensors"), device)?,
+            hubert: HubertLarge::load(
+                &HubertConfig::default(),
+                d.join("vevo_hubert.safetensors"),
+                device,
+            )?,
             hubert_mean: stats.get(1024, "mean")?,
             hubert_std: stats.get(1024, "std")?,
-            repcodec: RepCodec::load(&RepCodecConfig::default(), d.join("vevo_repcodec.safetensors"), device)?,
+            repcodec: RepCodec::load(
+                &RepCodecConfig::default(),
+                d.join("vevo_repcodec.safetensors"),
+                device,
+            )?,
             mel: MelSpectrogram::new(MelConfig::default(), device),
-            fmt: FlowMatchingTransformer::load(&FmtConfig::default(), d.join("vevo_fmt.safetensors"), device)?,
-            vocos: Vocos::load(VocosConfig::default(), d.join("vevo_vocos.safetensors"), device)?,
+            fmt: FlowMatchingTransformer::load(
+                &FmtConfig::default(),
+                d.join("vevo_fmt.safetensors"),
+                device,
+            )?,
+            vocos: Vocos::load(
+                VocosConfig::default(),
+                d.join("vevo_vocos.safetensors"),
+                device,
+            )?,
             device: device.clone(),
         })
     }
@@ -104,7 +126,9 @@ impl VevoEngine {
     pub fn content_style_codes(&self, wave16k: &[f32]) -> Result<Tensor> {
         let wav = Tensor::from_vec(wave16k.to_vec(), (1, wave16k.len()), &self.device)?;
         let feats = self.hubert.extract_features(&wav)?;
-        let normed = feats.broadcast_sub(&self.hubert_mean)?.broadcast_div(&self.hubert_std)?;
+        let normed = feats
+            .broadcast_sub(&self.hubert_mean)?
+            .broadcast_div(&self.hubert_std)?;
         self.repcodec.quantize(&normed)
     }
 
@@ -141,7 +165,9 @@ impl VevoEngine {
             None => Tensor::randn(0f32, 1f32, (1, target_len, prompt.dim(2)?), &self.device)?,
         };
 
-        let mel = self.fmt.reverse_diffusion(&cond, &prompt, noise, steps, 1.0, 0.75)?;
+        let mel = self
+            .fmt
+            .reverse_diffusion(&cond, &prompt, noise, steps, 1.0, 0.75)?;
         let wave = self.vocos.synthesize(&mel)?;
         Ok(wave)
     }
@@ -164,7 +190,13 @@ mod tests {
 
     fn ckpt_dir() -> Option<std::path::PathBuf> {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ckpt");
-        let need = ["vevo_hubert.safetensors", "vevo_hubert_stats.safetensors", "vevo_repcodec.safetensors", "vevo_fmt.safetensors", "vevo_vocos.safetensors"];
+        let need = [
+            "vevo_hubert.safetensors",
+            "vevo_hubert_stats.safetensors",
+            "vevo_repcodec.safetensors",
+            "vevo_fmt.safetensors",
+            "vevo_vocos.safetensors",
+        ];
         need.iter().all(|f| path.join(f).exists()).then_some(path)
     }
 
@@ -189,9 +221,17 @@ mod tests {
         let src_24k: Vec<f32> = fx["src_24k"].i(0).unwrap().to_vec1().unwrap();
         let ref_24k: Vec<f32> = fx["ref_24k"].i(0).unwrap().to_vec1().unwrap();
         let noise = fx["cfm_noise"].clone();
-        let want: Vec<f32> = fx["wave_out"].squeeze(0).unwrap().squeeze(0).unwrap().to_vec1().unwrap();
+        let want: Vec<f32> = fx["wave_out"]
+            .squeeze(0)
+            .unwrap()
+            .squeeze(0)
+            .unwrap()
+            .to_vec1()
+            .unwrap();
 
-        let got = engine.inference_fm(&src_24k, &ref_24k, 32, Some(noise)).unwrap();
+        let got = engine
+            .inference_fm(&src_24k, &ref_24k, 32, Some(noise))
+            .unwrap();
         assert_eq!(got.len(), want.len(), "sample count mismatch");
         let c = corr(&got, &want);
         assert!(c > 0.999, "e2e correlation {c}");

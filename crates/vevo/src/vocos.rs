@@ -69,7 +69,9 @@ impl ConvNeXtBlock {
         let residual = x;
         let x = self.dwconv.forward(x)?.transpose(1, 2)?;
         let x = self.norm.forward(&x)?;
-        let x = self.pwconv2.forward(&self.pwconv1.forward(&x)?.gelu_erf()?)?;
+        let x = self
+            .pwconv2
+            .forward(&self.pwconv1.forward(&x)?.gelu_erf()?)?;
         let x = x.broadcast_mul(&self.gamma)?.transpose(1, 2)?;
         residual + x
     }
@@ -95,7 +97,11 @@ impl Vocos {
         let bb = vb.pp("backbone");
         let mut blocks = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
-            blocks.push(ConvNeXtBlock::new(cfg.dim, cfg.intermediate_dim, bb.pp(format!("convnext.{i}")))?);
+            blocks.push(ConvNeXtBlock::new(
+                cfg.dim,
+                cfg.intermediate_dim,
+                bb.pp(format!("convnext.{i}")),
+            )?);
         }
         // torch.hann_window default (periodic=True): sin^2(pi*n/N).
         let window: Vec<f32> = (0..cfg.n_fft)
@@ -108,7 +114,11 @@ impl Vocos {
             embed: conv1d(cfg.input_channels, cfg.dim, 7, embed_cfg, bb.pp("embed"))?,
             norm: layer_norm(cfg.dim, LayerNormConfig::default(), bb.pp("norm"))?,
             blocks,
-            final_norm: layer_norm(cfg.dim, LayerNormConfig::default(), bb.pp("final_layer_norm"))?,
+            final_norm: layer_norm(
+                cfg.dim,
+                LayerNormConfig::default(),
+                bb.pp("final_layer_norm"),
+            )?,
             out: linear(cfg.dim, cfg.n_fft + 2, vb.pp("head.out"))?,
             window,
             ifft: FftPlanner::new().plan_fft_inverse(cfg.n_fft),
@@ -116,8 +126,14 @@ impl Vocos {
         })
     }
 
-    pub fn load<P: AsRef<std::path::Path>>(cfg: VocosConfig, path: P, device: &Device) -> Result<Self> {
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[path], candle_core::DType::F32, device)? };
+    pub fn load<P: AsRef<std::path::Path>>(
+        cfg: VocosConfig,
+        path: P,
+        device: &Device,
+    ) -> Result<Self> {
+        let vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(&[path], candle_core::DType::F32, device)?
+        };
         Self::new(cfg, vb).map_err(Into::into)
     }
 
@@ -189,7 +205,11 @@ impl Vocos {
         let mel = match mel.dims().len() {
             2 => mel.clone(),
             3 => mel.squeeze(0)?,
-            _ => return Err(vc_core::Error::Input("mel must be [frames, num_mels] or [1, frames, num_mels]".into())),
+            _ => {
+                return Err(vc_core::Error::Input(
+                    "mel must be [frames, num_mels] or [1, frames, num_mels]".into(),
+                ))
+            }
         };
         let (_frames, n_mels) = mel.dims2()?;
         if n_mels != self.cfg.input_channels {
@@ -221,7 +241,8 @@ mod tests {
     }
 
     fn ckpt() -> Option<std::path::PathBuf> {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ckpt/vevo_vocos.safetensors");
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../ckpt/vevo_vocos.safetensors");
         path.exists().then_some(path)
     }
 
@@ -234,7 +255,13 @@ mod tests {
         let model = Vocos::load(VocosConfig::default(), ckpt, &dev).unwrap();
 
         let mel = fx["fm_mel"].clone(); // [1, t, 128]
-        let want: Vec<f32> = fx["wave_out"].squeeze(0).unwrap().squeeze(0).unwrap().to_vec1().unwrap();
+        let want: Vec<f32> = fx["wave_out"]
+            .squeeze(0)
+            .unwrap()
+            .squeeze(0)
+            .unwrap()
+            .to_vec1()
+            .unwrap();
         let got = model.synthesize(&mel).unwrap();
 
         assert_eq!(got.len(), want.len(), "sample count mismatch");
