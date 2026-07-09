@@ -8,6 +8,7 @@ members = [
     "crates/seedvc",
     "crates/cosyvoice",
     "crates/fetch",
+    "crates/vevo",
 ]
 
 [workspace.package]
