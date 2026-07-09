@@ -163,7 +163,33 @@ in this VC path is probably inherently weaker than Seed-VC's** (never
 formally A/B'd for timbre similarity in the #71 recon, which focused on
 needle-scanning and RTF); a longer/cleaner reference clip and a direct
 `--engine seedvc` comparison on the same material are the next things
-to try. Not chasing this further as a "bug" without more field data.
+to try.
+
+**Follow-up (same field report):** a real 80 s live session recording,
+analyzed with the new `similarity_over_time` / `pairwise_similarity`
+examples against the *actual* reference used (`ref_trimmed.wav`, not
+`ref_stage1.wav` — an earlier round of this investigation used the
+wrong file), confirmed the user's impression: similarity dipped and
+recovered throughout, correlating with **voiced ratio (r ≈ +0.49)** and
+**F0 stability (r ≈ −0.44)** per 3 s window — clearly-voiced, pitch-
+stable speech converts closer to the reference; consonant-heavy,
+pitch-wavering, or otherwise less-clearly-voiced speech (fast/casual
+delivery, laughing, trailing intonation) converts with weaker
+conditioning and reads as closer to the source's own voice. This lines
+up with a `--wav`-driven control test on clean, comparable material
+consistently landing at 0.6–0.8 similarity through the identical
+streaming code path — the *mechanism* isn't broken (no literal
+passthrough leakage either: high-frequency energy above 12 kHz, where
+raw 48 kHz mic content would show but synthesized 24 kHz-native HiFT
+output wouldn't, stayed near zero throughout the recording) — but
+**live, expressive/casual speech is a harder regime for this VC path's
+speaker conditioning to hold onto than clean read-speech**, and the
+from-scratch sliding-window re-tokenization (§Streaming) plausibly
+amplifies this versus a hypothetical longer-context/incremental design.
+Not a discrete bug to fix; a characteristic to keep tuning around
+(candidates: larger `context`, a cleaner/more expressive reference
+clip, or revisiting whether Seed-VC's DiT line is simply more robust
+here).
 
 ## Citation
 
