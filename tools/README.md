@@ -68,3 +68,17 @@ clone with its checkpoints (`ckpts/xvc.pt`, `glm-4-voice-tokenizer/`,
 ```sh
 python3 tools/gen_xvc_fixtures.py --xvc-repo ~/tmp/xvc-recon/X-VC
 ```
+
+## Fine-tune data curation
+
+`seedvc_finetune_data.py` ([issue #81](https://github.com/m96-chan/babiniku.rs/issues/81),
+built during the [#80](https://github.com/m96-chan/babiniku.rs/issues/80)
+PoC) is not a parity fixture — it curates raw/noisy long-form audio into
+Seed-VC few-shot fine-tune clips (see the script's own docstring for the
+three-stage filter: Whisper repetition-loop rejection, Silero VAD,
+pyin voiced-ratio rejection of whispered-register audio):
+
+```sh
+pip install -r tools/requirements.txt transformers librosa soundfile
+python3 tools/seedvc_finetune_data.py --input long_recording.mp3 --output-dir clips/
+```
