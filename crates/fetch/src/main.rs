@@ -26,14 +26,25 @@ fn main() -> Result<()> {
     let mut cmd: Option<String> = None;
     let mut ckpt_dir: Option<PathBuf> = None;
     let mut yes = false;
+    let mut from_pth: Option<PathBuf> = None;
+    let mut out_prefix = "seedvc".to_string();
     while let Some(a) = args.next() {
         match a.as_str() {
             "--ckpt-dir" => {
                 ckpt_dir = Some(PathBuf::from(args.next().context("--ckpt-dir <dir>")?))
             }
             "--yes" | "-y" => yes = true,
+            // seedvc only: convert a *locally* fine-tuned checkpoint
+            // (official train.py's ft_model.pth) instead of downloading
+            // the base weights from HF — see fetch_seedvc's doc comment.
+            "--from-pth" => {
+                from_pth = Some(PathBuf::from(args.next().context("--from-pth <ft_model.pth>")?))
+            }
+            "--out-prefix" => out_prefix = args.next().context("--out-prefix <name>")?,
             "--help" | "-h" => {
-                println!("usage: babiniku-fetch <seedvc|vevo> [--ckpt-dir <dir>] [--yes]");
+                println!(
+                    "usage: babiniku-fetch <seedvc|vevo> [--ckpt-dir <dir>] [--yes]\n       babiniku-fetch seedvc --from-pth <ft_model.pth> [--out-prefix <name>] [--ckpt-dir <dir>] [--yes]"
+                );
                 return Ok(());
             }
             c if cmd.is_none() && !c.starts_with('-') => cmd = Some(c.to_string()),
@@ -47,7 +58,7 @@ fn main() -> Result<()> {
     std::fs::create_dir_all(&ckpt).with_context(|| format!("cannot create {}", ckpt.display()))?;
 
     match cmd.as_deref() {
-        Some("seedvc") => fetch_seedvc(&ckpt, yes),
+        Some("seedvc") => fetch_seedvc(&ckpt, yes, from_pth.as_deref(), &out_prefix),
         Some("vevo") => fetch_vevo(&ckpt, yes),
         Some(other) => {
             bail!("unknown engine {other:?} — supported: seedvc, vevo (meanvc/xvc: #65)")
@@ -251,7 +262,7 @@ fn save(map: &HashMap<String, Tensor>, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn fetch_seedvc(ckpt: &Path, yes: bool) -> Result<()> {
+fn fetch_seedvc(ckpt: &Path, yes: bool, from_pth: Option<&Path>, out_prefix: &str) -> Result<()> {
     confirm_gpl(yes)?;
     let dev = Device::Cpu;
     let _ = dev;
@@ -259,18 +270,62 @@ fn fetch_seedvc(ckpt: &Path, yes: bool) -> Result<()> {
     // Main checkpoint: DiT (cfm) + length regulator. The checkpoint's
     // style_encoder is dead weight; the real speaker encoder is the
     // standalone funasr CAM++ (see docs/seedvc.md).
-    let main = hf_file(
-        "Plachta/Seed-VC",
-        "DiT_seed_v2_uvit_whisper_small_wavenet_bigvgan_pruned.pth",
+    //
+    // `--from-pth` swaps in a *locally* fine-tuned checkpoint (the
+    // official `train.py`'s `ft_model.pth` — `state = {'net': {key:
+    // model[key].state_dict() for key in model}}`, i.e. the exact same
+    // `net.cfm.`/`net.length_regulator.` shape the HF release has,
+    // since fine-tuning only ever touches these two submodules — the
+    // frozen encoders/vocoder below are unaffected and still come from
+    // HF either way). `--out-prefix` avoids clobbering the base
+    // `seedvc_*` files when converting a fine-tune alongside them.
+    let main = match from_pth {
+        Some(p) => p.to_path_buf(),
+        None => hf_file(
+            "Plachta/Seed-VC",
+            "DiT_seed_v2_uvit_whisper_small_wavenet_bigvgan_pruned.pth",
+        )?,
+    };
+    // The HF release's cfm/length_regulator were saved from a DDP-
+    // wrapped model, which PyTorch auto-prefixes every key with
+    // "module." — our loaders (dit.rs's `vb.pp("module.estimator")`,
+    // regulator.rs's `vb.pp("module")`) hardcode that prefix. A
+    // single-GPU `train.py` fine-tune has no DDP wrapper, so its state
+    // dict lacks it; add it back so the same loaders work for both
+    // without touching the already golden-tested load paths.
+    let add_module_prefix = |sd: HashMap<String, Tensor>| -> HashMap<String, Tensor> {
+        if from_pth.is_some() && !sd.keys().any(|k| k.starts_with("module.")) {
+            sd.into_iter().map(|(k, v)| (format!("module.{k}"), v)).collect()
+        } else {
+            sd
+        }
+    };
+    save(
+        &add_module_prefix(read_pth(&main, Some("net.cfm."))?),
+        &ckpt.join(format!("{out_prefix}_dit.safetensors")),
     )?;
     save(
-        &read_pth(&main, Some("net.cfm."))?,
-        &ckpt.join("seedvc_dit.safetensors"),
+        &add_module_prefix(read_pth(&main, Some("net.length_regulator."))?),
+        &ckpt.join(format!("{out_prefix}_regulator.safetensors")),
     )?;
-    save(
-        &read_pth(&main, Some("net.length_regulator."))?,
-        &ckpt.join("seedvc_regulator.safetensors"),
-    )?;
+    if from_pth.is_some() {
+        // Fine-tuning never touches these; reuse the base files so the
+        // engine has a complete checkpoint set under out_prefix too.
+        for (suffix, base_name) in [
+            ("campplus", "seedvc_campplus"),
+            ("bigvgan", "seedvc_bigvgan"),
+            ("whisper", "seedvc_whisper"),
+        ] {
+            let src = ckpt.join(format!("{base_name}.safetensors"));
+            let dst = ckpt.join(format!("{out_prefix}_{suffix}.safetensors"));
+            if src.exists() && !dst.exists() {
+                std::fs::copy(&src, &dst)
+                    .with_context(|| format!("copy {} -> {}", src.display(), dst.display()))?;
+            }
+        }
+        eprintln!("{out_prefix} checkpoints ready under {}", ckpt.display());
+        return Ok(());
+    }
 
     // CAM++ speaker encoder (flat state dict).
     let camp = hf_file("funasr/campplus", "campplus_cn_common.bin")?;
